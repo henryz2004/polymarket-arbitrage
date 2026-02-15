@@ -180,8 +180,8 @@ class ExecutionEngine:
         """
         Handle bundle orders atomically - all orders must succeed or none.
 
-        For bundle arbitrage (buy YES + buy NO), both legs must fill or
-        we roll back to avoid directional exposure.
+        For bundle arbitrage (buy YES + buy NO) or neg-risk (buy all outcomes),
+        all legs must fill or we roll back to avoid directional exposure.
         """
         logger.info(f"Processing bundle signal with {len(signal.orders)} orders")
 
@@ -189,6 +189,8 @@ class ExecutionEngine:
         validated_orders = []
         for order_spec in signal.orders:
             try:
+                # CRITICAL FIX: Use per-leg market_id if provided (for neg-risk)
+                market_id = order_spec.get("market_id", signal.market_id)
                 token_type = order_spec["token_type"]
                 side = order_spec["side"]
                 price = order_spec["price"]
@@ -197,15 +199,15 @@ class ExecutionEngine:
 
                 # Check slippage
                 if self.config.enable_slippage_check and signal.opportunity:
-                    if not await self._check_slippage_fresh(signal.market_id, order_spec):
+                    if not await self._check_slippage_fresh(market_id, order_spec):
                         self.stats.slippage_rejections += 1
-                        logger.warning(f"Bundle rejected: slippage on {token_type}")
+                        logger.warning(f"Bundle rejected: slippage on {token_type} in {market_id}")
                         return  # Abort entire bundle
 
                 # Check risk limits
                 proposed_order = Order(
                     order_id="temp",
-                    market_id=signal.market_id,
+                    market_id=market_id,
                     token_type=token_type,
                     side=side,
                     price=price,
@@ -234,8 +236,11 @@ class ExecutionEngine:
 
         for order_spec in validated_orders:
             try:
+                # CRITICAL FIX: Use per-leg market_id
+                market_id = order_spec.get("market_id", signal.market_id)
+
                 order = await self._place_order(
-                    market_id=signal.market_id,
+                    market_id=market_id,
                     token_type=order_spec["token_type"],
                     side=order_spec["side"],
                     price=order_spec["price"],

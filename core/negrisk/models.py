@@ -1,0 +1,305 @@
+"""
+Negrisk Data Models
+====================
+
+Data structures for neg-risk arbitrage detection and execution.
+"""
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Optional
+
+
+class OutcomeStatus(Enum):
+    """Status of an outcome in a neg-risk event."""
+    ACTIVE = "active"           # Normal tradeable outcome
+    PLACEHOLDER = "placeholder"  # Unnamed placeholder (augmented neg-risk)
+    OTHER = "other"             # "Other" category
+    RESOLVED = "resolved"       # Already resolved
+
+
+@dataclass
+class NegriskConfig:
+    """Configuration for neg-risk arbitrage detection and execution."""
+
+    # Detection parameters
+    min_net_edge: float = 0.025          # 2.5% minimum NET edge (after fees & gas)
+    min_outcomes: int = 3                 # Minimum outcomes for neg-risk event
+    max_legs: int = 15                    # Maximum outcomes to trade
+
+    # Staleness parameters
+    staleness_ttl_ms: float = 2000.0      # 2 seconds max staleness
+    ws_sequence_gap_threshold: int = 5    # Max allowed sequence gaps
+
+    # Fee parameters (Polymarket)
+    taker_fee_bps: float = 150            # 1.5% taker fee
+    gas_per_leg: float = 0.05             # $0.05 gas per leg (conservative)
+
+    # Execution parameters
+    min_liquidity_per_outcome: float = 100.0   # Min $ liquidity per outcome
+    min_event_volume_24h: float = 10000.0      # Min event 24h volume
+    use_fok_orders: bool = True                # Use Fill-or-Kill orders
+
+    # Risk parameters
+    max_position_per_event: float = 500.0      # Max $ per event
+    skip_augmented_placeholders: bool = True   # Skip unnamed outcomes
+
+    # Refresh intervals
+    registry_refresh_seconds: float = 30.0     # How often to refresh event list
+    bba_ws_reconnect_delay: float = 1.0        # WebSocket reconnect delay
+
+
+@dataclass
+class OutcomeBBA:
+    """Best Bid/Ask for a single outcome."""
+    best_bid: Optional[float] = None
+    best_ask: Optional[float] = None
+    bid_size: Optional[float] = None
+    ask_size: Optional[float] = None
+    last_updated: datetime = field(default_factory=datetime.utcnow)
+    sequence_id: Optional[int] = None
+
+    @property
+    def spread(self) -> Optional[float]:
+        """Get bid-ask spread."""
+        if self.best_bid is not None and self.best_ask is not None:
+            return self.best_ask - self.best_bid
+        return None
+
+    @property
+    def mid_price(self) -> Optional[float]:
+        """Get mid price."""
+        if self.best_bid is not None and self.best_ask is not None:
+            return (self.best_bid + self.best_ask) / 2
+        return None
+
+    def is_stale(self, ttl_ms: float) -> bool:
+        """Check if this BBA data is stale."""
+        age_ms = (datetime.utcnow() - self.last_updated).total_seconds() * 1000
+        return age_ms > ttl_ms
+
+
+@dataclass
+class Outcome:
+    """
+    A single outcome in a neg-risk event.
+
+    For example, in "Who wins the 2024 election?":
+    - Outcome 1: "Trump" with token_id "123..."
+    - Outcome 2: "Biden" with token_id "456..."
+    - Outcome 3: "Other" with token_id "789..."
+    """
+    outcome_id: str               # Unique identifier
+    market_id: str                # Polymarket market ID for this outcome
+    condition_id: str             # Condition ID
+    token_id: str                 # CLOB token ID for YES shares
+    name: str                     # Display name (e.g., "Trump")
+    status: OutcomeStatus = OutcomeStatus.ACTIVE
+
+    # Current BBA data
+    bba: OutcomeBBA = field(default_factory=OutcomeBBA)
+
+    # Metadata
+    volume_24h: float = 0.0
+    liquidity: float = 0.0
+
+    @property
+    def ask_price(self) -> Optional[float]:
+        """Get current ask price (cost to buy YES)."""
+        return self.bba.best_ask
+
+    @property
+    def bid_price(self) -> Optional[float]:
+        """Get current bid price."""
+        return self.bba.best_bid
+
+    def is_tradeable(self, config: NegriskConfig) -> bool:
+        """
+        Check if this outcome is tradeable.
+
+        CRITICAL: For neg-risk arb, we MUST include "Other" outcomes.
+        Skipping "Other" means we don't hold all outcomes and can lose principal.
+        """
+        # CRITICAL FIX: Include OTHER status in tradeable outcomes
+        # Only skip PLACEHOLDER (unnamed in augmented neg-risk) and RESOLVED
+        if self.status == OutcomeStatus.RESOLVED:
+            return False
+
+        # Skip placeholders only if configured (augmented neg-risk)
+        if config.skip_augmented_placeholders and self.status == OutcomeStatus.PLACEHOLDER:
+            return False
+
+        # Must have an ask price
+        if self.bba.best_ask is None:
+            return False
+
+        # Must meet minimum liquidity
+        if self.bba.ask_size is not None and self.bba.ask_size < config.min_liquidity_per_outcome:
+            return False
+
+        return True
+
+
+@dataclass
+class NegriskEvent:
+    """
+    A neg-risk event containing multiple mutually exclusive outcomes.
+
+    For example: "2024 Presidential Election Winner"
+    - Contains outcomes for each candidate
+    - Only ONE outcome can win (winner-take-all)
+    - NegRisk adapter enables capital-efficient trading
+    """
+    event_id: str                 # Gamma API event ID
+    slug: str                     # URL slug
+    title: str                    # Event title/question
+    condition_id: str             # CTF condition ID
+
+    # Outcomes
+    outcomes: list[Outcome] = field(default_factory=list)
+
+    # Neg-risk flags
+    neg_risk: bool = True
+    neg_risk_augmented: bool = False  # Has placeholder outcomes
+
+    # Metadata
+    volume_24h: float = 0.0
+    liquidity: float = 0.0
+    end_date: Optional[datetime] = None
+
+    # Tracking
+    last_updated: datetime = field(default_factory=datetime.utcnow)
+
+    @property
+    def outcome_count(self) -> int:
+        """Get number of outcomes."""
+        return len(self.outcomes)
+
+    @property
+    def active_outcomes(self) -> list[Outcome]:
+        """
+        Get tradeable outcomes (includes OTHER, excludes PLACEHOLDER/RESOLVED).
+
+        CRITICAL: This must include "Other" outcomes for neg-risk arb to work.
+        """
+        return [
+            o for o in self.outcomes
+            if o.status not in (OutcomeStatus.RESOLVED, OutcomeStatus.PLACEHOLDER)
+        ]
+
+    @property
+    def sum_of_asks(self) -> Optional[float]:
+        """
+        Calculate sum of all ask prices.
+
+        If < 1.0, there's a potential arbitrage opportunity.
+        Returns None if any ask price is unavailable.
+        """
+        asks = [o.bba.best_ask for o in self.active_outcomes]
+        if None in asks or len(asks) == 0:
+            return None
+        return sum(asks)
+
+    @property
+    def sum_of_bids(self) -> Optional[float]:
+        """Calculate sum of all bid prices."""
+        bids = [o.bba.best_bid for o in self.active_outcomes]
+        if None in bids or len(bids) == 0:
+            return None
+        return sum(bids)
+
+    @property
+    def min_ask_liquidity(self) -> Optional[float]:
+        """Get minimum liquidity across all asks (bottleneck for sizing)."""
+        sizes = [o.bba.ask_size for o in self.active_outcomes if o.bba.ask_size is not None]
+        if not sizes:
+            return None
+        return min(sizes)
+
+    def get_token_ids(self) -> list[str]:
+        """Get all token IDs for WebSocket subscription."""
+        return [o.token_id for o in self.outcomes if o.token_id]
+
+    def has_stale_data(self, ttl_ms: float) -> bool:
+        """Check if any outcome has stale BBA data."""
+        return any(o.bba.is_stale(ttl_ms) for o in self.active_outcomes)
+
+
+@dataclass
+class NegriskOpportunity:
+    """
+    A detected neg-risk arbitrage opportunity.
+
+    Represents a situation where buying YES on all outcomes costs < $1.00,
+    guaranteeing profit when one outcome resolves to YES.
+    """
+    opportunity_id: str
+    event: NegriskEvent
+
+    # Pricing
+    sum_of_asks: float            # Total cost to buy all outcomes
+    gross_edge: float             # 1.0 - sum_of_asks (before fees)
+    net_edge: float               # After fees and gas
+
+    # Sizing
+    suggested_size: float         # Shares to buy of each outcome
+    max_size: float               # Maximum based on liquidity
+
+    # Execution details
+    legs: list[dict] = field(default_factory=list)  # Order specs for each leg
+
+    # Timing
+    detected_at: datetime = field(default_factory=datetime.utcnow)
+    expires_at: Optional[datetime] = None
+    executed: bool = False
+
+    @property
+    def total_cost(self) -> float:
+        """Total cost to execute this opportunity at suggested size."""
+        return self.sum_of_asks * self.suggested_size
+
+    @property
+    def expected_profit(self) -> float:
+        """Expected profit from this opportunity."""
+        return self.net_edge * self.suggested_size
+
+    @property
+    def num_legs(self) -> int:
+        """Number of orders needed."""
+        return len(self.event.active_outcomes)
+
+    def is_valid(self, config: NegriskConfig) -> bool:
+        """Check if opportunity is still valid."""
+        if self.executed:
+            return False
+        if self.expires_at and datetime.utcnow() > self.expires_at:
+            return False
+        if self.net_edge < config.min_net_edge:
+            return False
+        if self.event.has_stale_data(config.staleness_ttl_ms):
+            return False
+        return True
+
+
+@dataclass
+class NegriskStats:
+    """Statistics for neg-risk arbitrage operations."""
+    events_tracked: int = 0
+    opportunities_detected: int = 0
+    opportunities_executed: int = 0
+    total_profit: float = 0.0
+    total_volume: float = 0.0
+
+    # Timing stats
+    avg_detection_latency_ms: float = 0.0
+    avg_execution_latency_ms: float = 0.0
+
+    # Error tracking
+    stale_data_rejections: int = 0
+    liquidity_rejections: int = 0
+    execution_failures: int = 0
+
+    # Best opportunity seen
+    best_edge_seen: float = 0.0
+    best_edge_event: str = ""
