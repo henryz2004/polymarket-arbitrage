@@ -66,6 +66,9 @@ class NegriskEngine:
         # Scan interval
         self._scan_interval = 1.0  # Scan every 1 second for opportunities
 
+        # Track active event scans to prevent unbounded task spawning
+        self._active_event_scans: set[str] = set()
+
         logger.info("NegriskEngine initialized")
 
     async def start(self) -> None:
@@ -121,9 +124,15 @@ class NegriskEngine:
 
         PERFORMANCE FIX: Trigger immediate opportunity scan for the event
         instead of waiting for the periodic scan. This reduces latency.
+
+        DEDUPLICATION: Only spawn one scan task per event at a time to
+        prevent unbounded task creation on high-frequency price updates.
         """
+        # Don't spawn a new task if one is already running for this event
+        if event_id in self._active_event_scans:
+            return
+
         # Queue an immediate scan for this specific event
-        # This is safe to call from callback - it just creates a task
         asyncio.create_task(
             self._scan_event_for_opportunity(event_id),
             name=f"scan_event_{event_id}"
@@ -135,6 +144,9 @@ class NegriskEngine:
 
         Called by price update callback for low-latency detection.
         """
+        # Mark this event as being scanned
+        self._active_event_scans.add(event_id)
+
         try:
             # Get the event
             event = self.registry.get_event(event_id)
@@ -152,6 +164,9 @@ class NegriskEngine:
 
         except Exception as e:
             logger.debug(f"Event scan error for {event_id}: {e}")
+        finally:
+            # Always remove from active scans when done
+            self._active_event_scans.discard(event_id)
 
     def _is_event_tradeable(self, event: NegriskEvent) -> bool:
         """Check if an event meets basic tradability criteria."""
@@ -224,8 +239,11 @@ class NegriskEngine:
             # Submit to execution engine (queues signal, doesn't execute immediately)
             await self.execution_engine.submit_signal(signal)
 
+            # Track submission (not execution - that requires fill confirmation)
+            self.detector.stats.opportunities_submitted += 1
+
             # CRITICAL FIX: Don't mark as executed yet - that should happen
-            # when the orders are actually filled. For now, just log submission.
+            # when the orders are actually filled.
             # TODO: Add callback mechanism from execution engine to mark executed on fill.
 
             logger.info(f"Neg-risk opportunity submitted: {opportunity.opportunity_id}")
@@ -323,6 +341,7 @@ class NegriskEngine:
         return {
             "events_tracked": stats["registry"]["events_tracked"],
             "opportunities_detected": stats["detector"]["opportunities_detected"],
+            "opportunities_submitted": stats["detector"]["opportunities_submitted"],
             "opportunities_executed": stats["detector"]["opportunities_executed"],
             "total_profit": stats["detector"]["total_profit"],
             "best_edge_seen": stats["detector"]["best_edge_seen"],

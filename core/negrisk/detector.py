@@ -200,13 +200,19 @@ class NegriskDetector:
             logger.warning(f"Opportunity {opportunity.opportunity_id} rejected: stale data")
             return False
 
-        # Re-calculate edge with current prices
-        sum_of_asks = event.sum_of_asks
-        if sum_of_asks is None:
+        # CRITICAL FIX: Calculate sum_of_asks from tradeable outcomes only,
+        # matching the logic in _check_event. Don't use event.sum_of_asks
+        # which is based on active_outcomes - these can differ when an
+        # outcome is active but has insufficient liquidity.
+        tradeable = [o for o in event.outcomes if o.is_tradeable(self.config)]
+        asks = [o.bba.best_ask for o in tradeable]
+        if None in asks or len(asks) == 0:
             logger.warning(f"Opportunity {opportunity.opportunity_id} rejected: missing prices")
             return False
 
-        num_legs = len(event.active_outcomes)
+        sum_of_asks = sum(asks)
+        num_legs = len(tradeable)
+
         taker_fee_pct = self.config.taker_fee_bps / 10000
         fee_cost = taker_fee_pct * sum_of_asks
         total_gas = self.config.gas_per_leg * num_legs
@@ -258,6 +264,7 @@ class NegriskDetector:
         """Get statistics as a dictionary."""
         return {
             "opportunities_detected": self.stats.opportunities_detected,
+            "opportunities_submitted": self.stats.opportunities_submitted,
             "opportunities_executed": self.stats.opportunities_executed,
             "total_profit": round(self.stats.total_profit, 2),
             "total_volume": round(self.stats.total_volume, 2),

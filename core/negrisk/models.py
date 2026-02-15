@@ -287,7 +287,8 @@ class NegriskStats:
     """Statistics for neg-risk arbitrage operations."""
     events_tracked: int = 0
     opportunities_detected: int = 0
-    opportunities_executed: int = 0
+    opportunities_submitted: int = 0  # Submitted to execution engine
+    opportunities_executed: int = 0   # Actually filled (requires callback)
     total_profit: float = 0.0
     total_volume: float = 0.0
 
