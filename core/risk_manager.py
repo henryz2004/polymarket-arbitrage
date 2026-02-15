@@ -113,10 +113,15 @@ class RiskManager:
                 return False
         
         # Per-market exposure check
+        # Note: current_market_exposure is always >= 0 (absolute exposure in this market)
+        # new_exposure is positive for buys (adding exposure), negative for sells (reducing)
         current_market_exposure = self._market_exposure.get(order.market_id, 0)
         new_exposure = order.notional if order.side == OrderSide.BUY else -order.notional
+
+        # Calculate projected exposure - abs() is correct here because market exposure
+        # should always be positive (we track magnitude, not direction)
         projected_exposure = abs(current_market_exposure + new_exposure)
-        
+
         if projected_exposure > self.config.max_position_per_market:
             logger.warning(
                 f"Order rejected: would exceed market limit | "
@@ -124,13 +129,17 @@ class RiskManager:
                 f"{projected_exposure:.2f} > {self.config.max_position_per_market}"
             )
             return False
-        
+
         # Global exposure check
-        projected_global = self.state.global_exposure + abs(new_exposure)
+        # BUG FIX: Use signed new_exposure, not abs(), so sells reduce global exposure
+        # This correctly models closing positions reducing overall risk
+        projected_global = self.state.global_exposure + new_exposure
+        projected_global = max(0, projected_global)  # Exposure can't go negative
+
         if projected_global > self.config.max_global_exposure:
             logger.warning(
                 f"Order rejected: would exceed global limit | "
-                f"current={self.state.global_exposure:.2f} + order={abs(new_exposure):.2f} = "
+                f"current={self.state.global_exposure:.2f} + order={new_exposure:.2f} = "
                 f"{projected_global:.2f} > {self.config.max_global_exposure}"
             )
             return False
@@ -193,21 +202,29 @@ class RiskManager:
         """Update PnL tracking."""
         total_pnl = realized_pnl + unrealized_pnl
         self.state.daily_pnl = total_pnl
-        
+
         # Update peak and drawdown
         if total_pnl > self.state.peak_pnl:
             self.state.peak_pnl = total_pnl
-        
+
+        # Calculate drawdown - handle the case where peak is zero or negative
         if self.state.peak_pnl > 0:
+            # Standard case: drawdown as percentage of peak
             self.state.current_drawdown = (self.state.peak_pnl - total_pnl) / self.state.peak_pnl
+        elif total_pnl < 0:
+            # When peak is non-positive and we're losing money,
+            # calculate drawdown using max_daily_loss as reference.
+            # This ensures kill switch can trigger even if we start negative.
+            # e.g., if max_daily_loss is $500 and we've lost $50, drawdown = 10%
+            self.state.current_drawdown = abs(total_pnl) / self.config.max_daily_loss
         else:
             self.state.current_drawdown = 0.0
-        
+
         # Check for limit breaches
         if total_pnl < -self.config.max_daily_loss:
             if self.config.kill_switch_enabled and not self.state.kill_switch_triggered:
                 self._trigger_kill_switch("Daily loss limit exceeded")
-        
+
         if self.state.current_drawdown > self.config.max_drawdown_pct:
             if self.config.kill_switch_enabled and not self.state.kill_switch_triggered:
                 self._trigger_kill_switch("Drawdown limit exceeded")

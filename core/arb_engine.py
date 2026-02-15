@@ -33,20 +33,27 @@ class ArbConfig:
     # Bundle arbitrage
     min_edge: float = 0.01  # Minimum edge required (1%)
     bundle_arb_enabled: bool = True
-    
+
     # Market-making
     min_spread: float = 0.05  # Minimum spread to MM (5c)
     mm_enabled: bool = True
     tick_size: float = 0.01
-    
+
     # Sizing
     default_order_size: float = 50.0
     min_order_size: float = 5.0
     max_order_size: float = 200.0
-    
-    # Signal expiry
+
+    # Signal and opportunity expiry
     signal_expiry_seconds: float = 5.0
-    
+    opportunity_expiry_seconds: float = 10.0  # Max time to track an opportunity
+
+    # Opportunity validity threshold (as fraction of min_edge)
+    # Higher = more conservative (requires more edge to consider opportunity still valid)
+    # 0.5 = opportunity valid if edge is at least 50% of min_edge
+    # 0.75 = opportunity valid if edge is at least 75% of min_edge (more conservative)
+    validity_threshold: float = 0.75
+
     # Fees (in basis points - 100 bps = 1%)
     # Polymarket: ~0% maker, ~1.5% taker
     maker_fee_bps: float = 0        # Limit orders adding liquidity
@@ -145,38 +152,43 @@ class ArbEngine:
         """Check if any tracked opportunities have expired (prices moved away)."""
         now = datetime.utcnow()
         expired_keys = []
-        
+
+        # Use configurable threshold for opportunity validity
+        validity_threshold = self.config.validity_threshold
+
         for key, timing in self._active_opportunities.items():
             if timing.market_id != market_id:
                 continue
-            
+
             # Check if opportunity still exists
             still_valid = False
-            
+
             if "bundle_long" in timing.opportunity_type:
-                # Check if total ask is still < 1 - min_edge
+                # Check if total ask is still < 1 - min_edge * validity_threshold
                 if order_book.best_ask_yes and order_book.best_ask_no:
                     total_ask = order_book.best_ask_yes + order_book.best_ask_no
-                    if 1.0 - total_ask >= self.config.min_edge * 0.5:  # Use lower threshold
+                    required_edge = self.config.min_edge * validity_threshold
+                    if 1.0 - total_ask >= required_edge:
                         still_valid = True
-                        
+
             elif "bundle_short" in timing.opportunity_type:
-                # Check if total bid is still > 1 + min_edge
+                # Check if total bid is still > 1 + min_edge * validity_threshold
                 if order_book.best_bid_yes and order_book.best_bid_no:
                     total_bid = order_book.best_bid_yes + order_book.best_bid_no
-                    if total_bid - 1.0 >= self.config.min_edge * 0.5:
+                    required_edge = self.config.min_edge * validity_threshold
+                    if total_bid - 1.0 >= required_edge:
                         still_valid = True
-            
-            # Also expire if too old (10 seconds max)
+
+            # Use configurable expiry instead of hardcoded 10 seconds
             age_seconds = (now - timing.detected_at).total_seconds()
-            if age_seconds > 10:
+            if age_seconds > self.config.opportunity_expiry_seconds:
                 still_valid = False
-            
+
             if not still_valid:
                 timing.mark_expired(executed=False)
                 self._record_opportunity_duration(timing)
                 expired_keys.append(key)
-        
+
         for key in expired_keys:
             del self._active_opportunities[key]
     
