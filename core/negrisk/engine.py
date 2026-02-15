@@ -18,7 +18,7 @@ from typing import Optional
 
 from core.negrisk.bba_tracker import BBATracker
 from core.negrisk.detector import NegriskDetector
-from core.negrisk.models import NegriskConfig, NegriskOpportunity
+from core.negrisk.models import NegriskConfig, NegriskEvent, NegriskOpportunity
 from core.negrisk.registry import NegriskRegistry
 from core.execution import ExecutionEngine
 from core.risk_manager import RiskManager
@@ -119,13 +119,54 @@ class NegriskEngine:
         """
         Callback when a price updates.
 
-        This is called from the BBA tracker when WebSocket or CLOB
-        provides updated prices. We can use this to trigger immediate
-        opportunity scans for the affected event.
+        PERFORMANCE FIX: Trigger immediate opportunity scan for the event
+        instead of waiting for the periodic scan. This reduces latency.
         """
-        # For now, we rely on the periodic scan loop
-        # In the future, could add immediate event-specific scans here
-        pass
+        # Queue an immediate scan for this specific event
+        # This is safe to call from callback - it just creates a task
+        asyncio.create_task(
+            self._scan_event_for_opportunity(event_id),
+            name=f"scan_event_{event_id}"
+        )
+
+    async def _scan_event_for_opportunity(self, event_id: str) -> None:
+        """
+        Scan a specific event for arbitrage opportunity.
+
+        Called by price update callback for low-latency detection.
+        """
+        try:
+            # Get the event
+            event = self.registry.get_event(event_id)
+            if not event:
+                return
+
+            # Check if tradeable
+            if not self._is_event_tradeable(event):
+                return
+
+            # Detect opportunity
+            opportunity = self.detector._check_event(event)
+            if opportunity:
+                await self._execute_opportunity(opportunity)
+
+        except Exception as e:
+            logger.debug(f"Event scan error for {event_id}: {e}")
+
+    def _is_event_tradeable(self, event: NegriskEvent) -> bool:
+        """Check if an event meets basic tradability criteria."""
+        # Check outcome count
+        tradeable = [o for o in event.outcomes if o.is_tradeable(self.config)]
+        if len(tradeable) < self.config.min_outcomes:
+            return False
+        if len(tradeable) > self.config.max_legs:
+            return False
+
+        # Check volume
+        if event.volume_24h < self.config.min_event_volume_24h:
+            return False
+
+        return True
 
     async def _scan_loop(self) -> None:
         """Main scanning loop - periodically check for opportunities."""

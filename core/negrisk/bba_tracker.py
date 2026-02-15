@@ -185,7 +185,8 @@ class BBATracker:
                     # Full order book snapshot
                     await self._handle_book_update(asset_id, event)
                 elif event_type == "price_change":
-                    # Price change - fetch fresh from CLOB
+                    # Price change - just trigger callback, no CLOB fetch
+                    # We'll fetch fresh prices from CLOB only before execution
                     await self._handle_price_change(asset_id, event)
 
         except json.JSONDecodeError:
@@ -237,9 +238,19 @@ class BBATracker:
                 self.on_price_update(event_obj.event_id, token_id)
 
     async def _handle_price_change(self, token_id: str, event: dict) -> None:
-        """Handle a price change event - fetch fresh from CLOB."""
-        # For critical price changes, verify with CLOB API
-        await self._fetch_clob_price(token_id)
+        """
+        Handle a price change event.
+
+        PERFORMANCE FIX: Don't fetch from CLOB on every price change.
+        WebSocket book events provide BBA data, and we fetch fresh from
+        CLOB before execution anyway. Just trigger the callback.
+        """
+        # Trigger callback to notify engine of price change
+        if self.on_price_update:
+            result = self.registry.get_event_by_token(token_id)
+            if result:
+                event_obj, outcome = result
+                self.on_price_update(event_obj.event_id, token_id)
 
     async def _fetch_clob_price(self, token_id: str) -> None:
         """Fetch fresh price from CLOB API."""
