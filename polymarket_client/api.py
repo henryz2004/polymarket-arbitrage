@@ -579,15 +579,32 @@ class PolymarketClient(BasePolymarketClient):
             timestamp=datetime.utcnow(),
         )
     
-    async def stream_orderbook(self, market_ids: list[str], use_simulation: bool = False) -> AsyncIterator[tuple[str, OrderBook]]:
+    async def stream_orderbook(
+        self,
+        market_ids: list[str],
+        use_simulation: bool = False,
+        use_websocket: bool = False,
+    ) -> AsyncIterator[tuple[str, OrderBook]]:
         """
         Stream order book updates.
-        
+
+        Args:
+            market_ids: List of market IDs to stream
+            use_simulation: If True, generates simulated data with opportunities
+            use_websocket: If True, uses WebSocket for real-time updates (much faster!)
+
         If use_simulation=True, generates simulated data with opportunities.
-        Otherwise fetches REAL data from Polymarket CLOB API.
+        If use_websocket=True, uses WebSocket streaming (instant updates).
+        Otherwise fetches REAL data from Polymarket CLOB API via HTTP polling.
         """
         if use_simulation:
             async for item in self._stream_simulated_orderbooks(market_ids):
+                yield item
+            return
+
+        if use_websocket:
+            logger.info("Using WebSocket streaming for real-time updates")
+            async for item in self.stream_orderbook_websocket(market_ids):
                 yield item
             return
         
@@ -701,7 +718,7 @@ class PolymarketClient(BasePolymarketClient):
     async def _connect_websocket(self, market_ids: list[str]) -> None:
         """
         Connect to Polymarket WebSocket.
-        
+
         TODO: Implement actual WebSocket connection and subscription.
         """
         try:
@@ -710,7 +727,7 @@ class PolymarketClient(BasePolymarketClient):
                 ping_interval=30,
                 ping_timeout=10,
             )
-            
+
             # Subscribe to markets
             for market_id in market_ids:
                 subscribe_msg = json.dumps({
@@ -720,12 +737,152 @@ class PolymarketClient(BasePolymarketClient):
                 })
                 await self._ws_connection.send(subscribe_msg)
                 self._ws_subscriptions.add(market_id)
-            
+
             logger.info(f"WebSocket connected, subscribed to {len(market_ids)} markets")
-            
+
         except Exception as e:
             logger.error(f"WebSocket connection failed: {e}")
             raise
+
+    async def stream_orderbook_websocket(
+        self,
+        market_ids: list[str],
+    ) -> AsyncIterator[tuple[str, OrderBook]]:
+        """
+        Stream order book updates via WebSocket.
+
+        This is much faster than HTTP polling - updates are pushed in real-time.
+
+        Yields:
+            Tuple of (market_id, OrderBook) for each update
+        """
+        # Build token_id -> market_id mapping from cache
+        token_to_market: dict[str, str] = {}
+        token_to_type: dict[str, TokenType] = {}
+        market_books: dict[str, dict[TokenType, TokenOrderBook]] = {}
+
+        for market_id in market_ids:
+            if market_id in self._markets_cache:
+                market = self._markets_cache[market_id]
+                if market.yes_token_id:
+                    token_to_market[market.yes_token_id] = market_id
+                    token_to_type[market.yes_token_id] = TokenType.YES
+                if market.no_token_id:
+                    token_to_market[market.no_token_id] = market_id
+                    token_to_type[market.no_token_id] = TokenType.NO
+                market_books[market_id] = {}
+
+        all_token_ids = list(token_to_market.keys())
+
+        if not all_token_ids:
+            logger.warning("No token IDs found for WebSocket subscription")
+            return
+
+        logger.info(f"Starting WebSocket stream for {len(all_token_ids)} tokens ({len(market_ids)} markets)")
+
+        reconnect_delay = 1.0
+        max_reconnect_delay = 30.0
+
+        while True:
+            try:
+                async with websockets.connect(
+                    self.ws_url,
+                    ping_interval=30,
+                    ping_timeout=10,
+                    close_timeout=5,
+                ) as ws:
+                    # Reset reconnect delay on successful connection
+                    reconnect_delay = 1.0
+
+                    # Subscribe to all tokens
+                    subscribe_msg = {
+                        "type": "MARKET",
+                        "assets_ids": all_token_ids,
+                    }
+                    await ws.send(json.dumps(subscribe_msg))
+                    logger.info(f"WebSocket subscribed to {len(all_token_ids)} tokens")
+
+                    # Process messages
+                    async for message in ws:
+                        try:
+                            raw_data = json.loads(message)
+
+                            # Messages come as a list
+                            events = raw_data if isinstance(raw_data, list) else [raw_data]
+
+                            for event in events:
+                                if not isinstance(event, dict):
+                                    continue
+
+                                event_type = event.get("event_type")
+                                asset_id = event.get("asset_id")
+
+                                if not asset_id or asset_id not in token_to_market:
+                                    continue
+
+                                market_id = token_to_market[asset_id]
+                                token_type = token_to_type[asset_id]
+
+                                if event_type == "book":
+                                    # Full order book snapshot
+                                    token_book = self._parse_ws_book(event, token_type)
+                                    market_books[market_id][token_type] = token_book
+
+                                elif event_type == "price_change":
+                                    # Incremental update - update best bid/ask
+                                    # For now, we treat this as a signal to use the latest data
+                                    # Full integration would update the book incrementally
+                                    pass
+
+                                # If we have both YES and NO books, yield the combined orderbook
+                                if (TokenType.YES in market_books.get(market_id, {}) and
+                                    TokenType.NO in market_books.get(market_id, {})):
+
+                                    orderbook = OrderBook(
+                                        market_id=market_id,
+                                        yes=market_books[market_id][TokenType.YES],
+                                        no=market_books[market_id][TokenType.NO],
+                                        timestamp=datetime.utcnow(),
+                                    )
+                                    yield (market_id, orderbook)
+
+                        except json.JSONDecodeError:
+                            logger.debug("Failed to parse WebSocket message")
+                            continue
+                        except Exception as e:
+                            logger.debug(f"Error processing WebSocket message: {e}")
+                            continue
+
+            except websockets.exceptions.ConnectionClosed as e:
+                logger.warning(f"WebSocket connection closed: {e}. Reconnecting in {reconnect_delay}s...")
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
+
+            except asyncio.CancelledError:
+                logger.info("WebSocket stream cancelled")
+                raise
+
+            except Exception as e:
+                logger.error(f"WebSocket error: {e}. Reconnecting in {reconnect_delay}s...")
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
+
+    def _parse_ws_book(self, event: dict, token_type: TokenType) -> TokenOrderBook:
+        """Parse a WebSocket book event into TokenOrderBook."""
+        bids = [
+            PriceLevel(price=float(level["price"]), size=float(level["size"]))
+            for level in event.get("bids", [])
+        ]
+        asks = [
+            PriceLevel(price=float(level["price"]), size=float(level["size"]))
+            for level in event.get("asks", [])
+        ]
+
+        return TokenOrderBook(
+            token_type=token_type,
+            bids=OrderBookSide(levels=bids),
+            asks=OrderBookSide(levels=asks),
+        )
     
     async def get_positions(self) -> dict[str, dict[TokenType, Position]]:
         """

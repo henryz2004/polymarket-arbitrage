@@ -74,17 +74,22 @@ risk:
 mode:
   # Trading mode: "live" or "dry_run"
   trading_mode: "dry_run"
-  
+
   # Data mode: "real" or "simulation"
   # - "real": Fetch actual order books from Polymarket CLOB API
   # - "simulation": Generate fake data with opportunities (for demos/screenshots)
   data_mode: "real"  # <-- CHANGE TO "simulation" FOR DEMOS
-  
+
+  # WebSocket streaming (EXPERIMENTAL)
+  # - true: Use WebSocket for real-time updates (instant, much faster!)
+  # - false: Use HTTP polling (default, slower but more stable)
+  use_websocket: false  # <-- Set to true for real-time updates
+
   # Cross-platform arbitrage (Polymarket + Kalshi)
   cross_platform_enabled: true    # Enable cross-platform arbitrage detection
   kalshi_enabled: true            # Enable Kalshi market monitoring
   min_match_similarity: 0.6       # Minimum similarity score for market matching (0-1)
-  
+
   # Dry run settings
   dry_run_initial_balance: 10000
   simulate_fills: true

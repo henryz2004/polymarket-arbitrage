@@ -70,6 +70,7 @@ class ModeConfig:
     """Trading mode configuration."""
     trading_mode: str = "dry_run"  # "live" or "dry_run"
     data_mode: str = "real"  # "real" or "simulation" - use simulation for demos
+    use_websocket: bool = False  # Use WebSocket for real-time updates (faster!)
     cross_platform_enabled: bool = True  # Enable cross-platform arbitrage (Polymarket + Kalshi)
     kalshi_enabled: bool = True  # Enable Kalshi market monitoring
     min_match_similarity: float = 0.6  # Minimum similarity score for market matching (0-1)

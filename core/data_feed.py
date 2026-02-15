@@ -140,23 +140,38 @@ class DataFeed:
     
     async def _stream_orderbooks(self) -> None:
         """Stream order book updates."""
-        # Use simulation for demo/screenshots, real data for production
-        # Check config.mode.data_mode (set in config.yaml)
+        # Check config for data mode and WebSocket preference
+        # Config structure: self.config.mode.data_mode, self.config.mode.use_websocket
         use_simulation = getattr(self.config, 'use_simulation', False)
-        
+        use_websocket = False
+
+        if self.config and hasattr(self.config, 'mode'):
+            use_websocket = getattr(self.config.mode, 'use_websocket', False)
+
+        if use_websocket:
+            logger.info("Using WebSocket streaming for real-time updates")
+        elif use_simulation:
+            logger.info("Using simulation mode with fake opportunities")
+        else:
+            logger.info("Using HTTP polling for order book updates")
+
         while self._running:
             try:
-                async for market_id, orderbook in self.client.stream_orderbook(self.market_ids, use_simulation=use_simulation):
+                async for market_id, orderbook in self.client.stream_orderbook(
+                    self.market_ids,
+                    use_simulation=use_simulation,
+                    use_websocket=use_websocket,
+                ):
                     if not self._running:
                         break
-                    
+
                     self._order_books[market_id] = orderbook
                     self._last_update[market_id] = datetime.utcnow()
                     self._update_count += 1
-                    
+
                     # Update market state
                     self._update_market_state(market_id)
-                    
+
             except asyncio.CancelledError:
                 raise
             except Exception as e:
