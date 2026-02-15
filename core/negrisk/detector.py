@@ -87,22 +87,9 @@ class NegriskDetector:
             return None
         sum_of_asks = sum(asks)
 
-        # Calculate fees and costs
+        # Calculate gross edge first
         num_legs = len(tradeable)
-        taker_fee_pct = self.config.taker_fee_bps / 10000  # Convert bps to decimal
-        total_gas = self.config.gas_per_leg * num_legs
-
-        # Fee is applied to each leg's notional
-        # For neg-risk arb, we're buying at ask prices, so fee = taker_fee_pct * sum_of_asks
-        fee_cost = taker_fee_pct * sum_of_asks
-
-        # Calculate edges
         gross_edge = 1.0 - sum_of_asks
-        net_edge = gross_edge - fee_cost - total_gas
-
-        # Check minimum net edge (after fees and gas)
-        if net_edge < self.config.min_net_edge:
-            return None
 
         # CRITICAL FIX: Check liquidity from tradeable outcomes only
         ask_sizes = [o.bba.ask_size for o in tradeable if o.bba.ask_size is not None]
@@ -115,12 +102,10 @@ class NegriskDetector:
             self.stats.liquidity_rejections += 1
             return None
 
-        # Calculate sizing
+        # Calculate sizing BEFORE calculating net edge
         # Size is constrained by:
         # 1. Minimum liquidity across all tradeable outcomes (bottleneck)
         # 2. Max position per event
-        # 3. Min liquidity per outcome requirement
-
         max_size_liquidity = min_liquidity
         max_size_risk = self.config.max_position_per_event / sum_of_asks if sum_of_asks > 0 else 0
 
@@ -128,6 +113,23 @@ class NegriskDetector:
         suggested_size = max_size * 0.8  # Use 80% of max for safety
 
         if suggested_size <= 0:
+            return None
+
+        # CRITICAL FIX: Calculate gas per share (amortized over trade size)
+        # Gas is a FIXED COST in dollars, not per-share
+        # We need to amortize it over the number of shares to get per-share cost
+        total_gas_cost = self.config.gas_per_leg * num_legs  # Total $ gas cost
+        gas_per_share = total_gas_cost / suggested_size if suggested_size > 0 else total_gas_cost
+
+        # Fee is per-notional (per-share)
+        taker_fee_pct = self.config.taker_fee_bps / 10000
+        fee_per_share = taker_fee_pct * sum_of_asks
+
+        # Net edge (all per-share metrics now)
+        net_edge = gross_edge - fee_per_share - gas_per_share
+
+        # Check minimum net edge (after fees and gas)
+        if net_edge < self.config.min_net_edge:
             return None
 
         # Check cooldown to avoid spam
@@ -177,7 +179,7 @@ class NegriskDetector:
         logger.info(
             f"Neg-risk opportunity: {event.title[:40]} | "
             f"sum_asks={sum_of_asks:.4f} | gross={gross_edge:.4f} | "
-            f"fees={fee_cost:.4f} | gas={total_gas:.4f} | "
+            f"fees={fee_per_share:.4f} | gas/share={gas_per_share:.6f} | "
             f"NET edge={net_edge:.4f} | legs={num_legs} | size={suggested_size:.2f}"
         )
 
@@ -213,11 +215,16 @@ class NegriskDetector:
         sum_of_asks = sum(asks)
         num_legs = len(tradeable)
 
-        taker_fee_pct = self.config.taker_fee_bps / 10000
-        fee_cost = taker_fee_pct * sum_of_asks
-        total_gas = self.config.gas_per_leg * num_legs
+        # CRITICAL FIX: Amortize gas over trade size (same as _check_event)
+        total_gas_cost = self.config.gas_per_leg * num_legs
+        gas_per_share = total_gas_cost / opportunity.suggested_size if opportunity.suggested_size > 0 else total_gas_cost
 
-        net_edge = 1.0 - sum_of_asks - fee_cost - total_gas
+        # Fee is per-share
+        taker_fee_pct = self.config.taker_fee_bps / 10000
+        fee_per_share = taker_fee_pct * sum_of_asks
+
+        # Net edge (all per-share)
+        net_edge = 1.0 - sum_of_asks - fee_per_share - gas_per_share
 
         if net_edge < self.config.min_net_edge:
             logger.warning(
