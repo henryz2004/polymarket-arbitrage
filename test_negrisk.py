@@ -44,7 +44,7 @@ async def test_negrisk():
         min_net_edge=0.020,           # 2.0% minimum net edge (relaxed for testing)
         min_outcomes=3,               # At least 3 outcomes
         max_legs=15,                  # Max 15 outcomes per bundle
-        staleness_ttl_ms=5000.0,      # 5 second staleness (relaxed for testing)
+        staleness_ttl_ms=60000.0,     # 60 second staleness (realistic for prediction markets)
         taker_fee_bps=150,            # 1.5% taker fee
         gas_per_leg=0.05,             # $0.05 gas per leg
         min_liquidity_per_outcome=50.0,  # $50 min (relaxed for testing)
@@ -101,9 +101,23 @@ async def test_negrisk():
     )
     await tracker.start()
 
-    # Wait for WebSocket to connect and get some data
-    print("Waiting 10 seconds for price data...")
-    await asyncio.sleep(10)
+    # Wait for WebSocket to connect
+    print("Waiting 5 seconds for WebSocket connection...")
+    await asyncio.sleep(5)
+
+    # Seed initial BBA data for top events
+    print("Seeding BBA data for top 30 events...")
+    all_events = registry.get_all_events()
+    sorted_events = sorted(all_events, key=lambda e: e.volume_24h, reverse=True)
+    top_events = sorted_events[:30]
+
+    for i, event in enumerate(top_events):
+        await tracker.fetch_all_prices(event)
+        if (i + 1) % 10 == 0:
+            print(f"  Seeded {i + 1}/{len(top_events)} events...")
+
+    print("BBA seeding complete. Waiting 5 more seconds for WebSocket data...")
+    await asyncio.sleep(5)
 
     # Show tracker stats
     tracker_stats = tracker.get_stats()
