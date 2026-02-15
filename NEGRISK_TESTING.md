@@ -84,7 +84,7 @@ NegriskConfig(
     max_legs=15,                     # Max 15 outcomes
     staleness_ttl_ms=60000.0,        # 60 second freshness
     taker_fee_bps=150,               # 1.5% Polymarket fee
-    gas_per_leg=0.05,                # $0.05 gas per leg
+    gas_per_leg=0.01,                # $0.01 gas per leg (realistic for Polygon)
     min_liquidity_per_outcome=50.0,  # $50 minimum
     min_event_volume_24h=5000.0,     # $5k volume minimum
 )

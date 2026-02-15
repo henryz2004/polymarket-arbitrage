@@ -34,7 +34,7 @@ class NegriskConfig:
 
     # Fee parameters (Polymarket)
     taker_fee_bps: float = 150            # 1.5% taker fee
-    gas_per_leg: float = 0.05             # $0.05 gas per leg (conservative)
+    gas_per_leg: float = 0.01             # $0.01 gas per leg (realistic for Polygon)
 
     # Execution parameters
     min_liquidity_per_outcome: float = 100.0   # Min $ liquidity per outcome

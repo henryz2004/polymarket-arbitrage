@@ -46,7 +46,7 @@ async def test_negrisk():
         max_legs=15,                  # Max 15 outcomes per bundle
         staleness_ttl_ms=60000.0,     # 60 second staleness (realistic for prediction markets)
         taker_fee_bps=150,            # 1.5% taker fee
-        gas_per_leg=0.05,             # $0.05 gas per leg
+        gas_per_leg=0.01,             # $0.01 gas per leg (realistic for Polygon)
         min_liquidity_per_outcome=50.0,  # $50 min (relaxed for testing)
         min_event_volume_24h=5000.0,     # $5k min volume (relaxed for testing)
         max_position_per_event=500.0,

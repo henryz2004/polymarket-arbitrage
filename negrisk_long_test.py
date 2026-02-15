@@ -82,7 +82,7 @@ class NegriskLongTest:
             max_legs=15,
             staleness_ttl_ms=60000.0,     # 60 seconds
             taker_fee_bps=150,
-            gas_per_leg=0.05,
+            gas_per_leg=0.01,
             min_liquidity_per_outcome=50.0,
             min_event_volume_24h=5000.0,
             max_position_per_event=500.0,
