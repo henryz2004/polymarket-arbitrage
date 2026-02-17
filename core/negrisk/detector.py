@@ -26,6 +26,38 @@ from core.negrisk.models import (
 logger = logging.getLogger(__name__)
 
 
+def _walk_book(levels: list, target_size: float) -> tuple[float, float]:
+    """
+    Walk order book levels to find average fill price at target_size.
+
+    Args:
+        levels: List of PriceLevel(price, size) sorted best-to-worst
+        target_size: Number of shares to fill
+
+    Returns:
+        (avg_fill_price, max_fillable_size)
+        If not enough depth, returns (avg_price_of_available, total_available)
+    """
+    if not levels or target_size <= 0:
+        return (0.0, 0.0)
+
+    total_filled = 0.0
+    total_cost = 0.0
+
+    for level in levels:
+        fill_at_level = min(level.size, target_size - total_filled)
+        total_cost += fill_at_level * level.price
+        total_filled += fill_at_level
+        if total_filled >= target_size:
+            break
+
+    if total_filled <= 0:
+        return (0.0, 0.0)
+
+    avg_price = total_cost / total_filled
+    return (avg_price, total_filled)
+
+
 def _compute_fee_per_share(fee_rate_bps: float, prices: list[float], side: str) -> float:
     """
     Compute total taker fee per share across all legs using the Polymarket
@@ -206,6 +238,31 @@ class NegriskDetector:
         if suggested_size <= 0:
             return None
 
+        # Apply depth scanning if enabled and depth data is available
+        depth_adjusted = False
+        if self.config.use_depth_scanning:
+            has_depth = all(len(o.bba.ask_levels) > 0 for o in tradeable)
+
+            if has_depth:
+                # Recalculate prices using depth
+                depth_adjusted_prices = []
+                depth_max_sizes = []
+
+                for outcome in tradeable:
+                    avg_price, max_fill = _walk_book(outcome.bba.ask_levels, suggested_size)
+                    if max_fill < suggested_size:
+                        # Not enough depth — reduce size to what's available
+                        suggested_size = max_fill * 0.8
+                    depth_adjusted_prices.append(avg_price)
+                    depth_max_sizes.append(max_fill)
+
+                if suggested_size > 0:
+                    # Recalculate all metrics with depth-adjusted prices
+                    sum_of_asks = sum(depth_adjusted_prices)
+                    gross_edge = 1.0 - sum_of_asks
+                    asks = depth_adjusted_prices  # Use depth prices for fee calculation
+                    depth_adjusted = True
+
         # CRITICAL FIX: Calculate gas per share (amortized over trade size)
         # Gas is a FIXED COST in dollars, not per-share
         # We need to amortize it over the number of shares to get per-share cost
@@ -232,6 +289,7 @@ class NegriskDetector:
             "net_edge": round(net_edge, 4),
             "min_liq": round(min_liquidity, 0),
             "size": round(suggested_size, 0),
+            "depth_adjusted": depth_adjusted,
         })
 
         # Check minimum net edge (after fees and gas)
@@ -387,6 +445,31 @@ class NegriskDetector:
         if suggested_size <= 0:
             return None
 
+        # Apply depth scanning if enabled and depth data is available
+        depth_adjusted = False
+        if self.config.use_depth_scanning:
+            has_depth = all(len(o.bba.bid_levels) > 0 for o in tradeable)
+
+            if has_depth:
+                # Recalculate prices using depth
+                depth_adjusted_prices = []
+                depth_max_sizes = []
+
+                for outcome in tradeable:
+                    avg_price, max_fill = _walk_book(outcome.bba.bid_levels, suggested_size)
+                    if max_fill < suggested_size:
+                        # Not enough depth — reduce size to what's available
+                        suggested_size = max_fill * 0.8
+                    depth_adjusted_prices.append(avg_price)
+                    depth_max_sizes.append(max_fill)
+
+                if suggested_size > 0:
+                    # Recalculate all metrics with depth-adjusted prices
+                    sum_of_bids = sum(depth_adjusted_prices)
+                    gross_edge = sum_of_bids - 1.0
+                    bids = depth_adjusted_prices  # Use depth prices for fee calculation
+                    depth_adjusted = True
+
         # Gas per share (amortized)
         total_gas_cost = self.config.gas_per_leg * num_legs
         gas_per_share = total_gas_cost / suggested_size if suggested_size > 0 else total_gas_cost
@@ -411,6 +494,7 @@ class NegriskDetector:
             "net_edge": round(net_edge, 4),
             "min_liq": round(min_liquidity, 0),
             "size": round(suggested_size, 0),
+            "depth_adjusted": depth_adjusted,
         })
 
         # Check minimum net edge

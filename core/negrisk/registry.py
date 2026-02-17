@@ -370,6 +370,8 @@ class NegriskRegistry:
         ask_size: Optional[float] = None,
         sequence_id: Optional[int] = None,
         source: str = "unknown",
+        bid_levels: Optional[list] = None,
+        ask_levels: Optional[list] = None,
     ) -> None:
         """Update BBA for an outcome by token ID."""
         result = self.get_event_by_token(token_id)
@@ -384,6 +386,10 @@ class NegriskRegistry:
         outcome.bba.last_updated = datetime.utcnow()
         outcome.bba.sequence_id = sequence_id
         outcome.bba.source = source
+        if bid_levels is not None:
+            outcome.bba.bid_levels = bid_levels
+        if ask_levels is not None:
+            outcome.bba.ask_levels = ask_levels
 
     def get_stats(self) -> dict:
         """Get registry statistics."""
