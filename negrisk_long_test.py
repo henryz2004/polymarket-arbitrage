@@ -107,12 +107,16 @@ class NegriskLongTest:
         # Metrics
         self.total_scans = 0
         self.total_opportunities = 0
-        self.opportunities_by_edge: dict[str, int] = {
-            "1.5-2.0%": 0,
-            "2.0-3.0%": 0,
-            "3.0-5.0%": 0,
-            "5.0%+": 0,
-        }
+        # Build dynamic edge buckets based on min_net_edge
+        min_pct = self.min_net_edge * 100
+        self._edge_thresholds = sorted({min_pct} | {t for t in [2.0, 3.0, 5.0] if t > min_pct})
+        self.opportunities_by_edge: dict[str, int] = {}
+        for i, t in enumerate(self._edge_thresholds):
+            if i + 1 < len(self._edge_thresholds):
+                label = f"{t:.1f}-{self._edge_thresholds[i+1]:.1f}%"
+            else:
+                label = f"{t:.1f}%+"
+            self.opportunities_by_edge[label] = 0
 
         self.logger = logging.getLogger("negrisk_test")
 
@@ -441,15 +445,15 @@ class NegriskLongTest:
     def _categorize_opportunity(self, opp: NegriskOpportunity):
         """Categorize opportunity by edge size."""
         edge_pct = opp.net_edge * 100
+        labels = list(self.opportunities_by_edge.keys())
+        thresholds = self._edge_thresholds
 
-        if edge_pct < 2.0:
-            self.opportunities_by_edge["1.5-2.0%"] += 1
-        elif edge_pct < 3.0:
-            self.opportunities_by_edge["2.0-3.0%"] += 1
-        elif edge_pct < 5.0:
-            self.opportunities_by_edge["3.0-5.0%"] += 1
-        else:
-            self.opportunities_by_edge["5.0%+"] += 1
+        for i in range(len(thresholds) - 1, -1, -1):
+            if edge_pct >= thresholds[i]:
+                self.opportunities_by_edge[labels[i]] += 1
+                return
+        # Below all thresholds — put in first bucket
+        self.opportunities_by_edge[labels[0]] += 1
 
     def _log_stats_snapshot(self):
         """Log current statistics snapshot."""
