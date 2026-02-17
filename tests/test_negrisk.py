@@ -1137,5 +1137,303 @@ class TestPartialPositions:
         assert opportunity is None
 
 
+class TestBinaryBundleArb:
+    """Test binary bundle arbitrage detection."""
+
+    def test_binary_buy_opportunity(self):
+        """Test detection of binary buy opportunity when sum_asks < 1.0."""
+        from core.negrisk.binary_detector import BinaryBundleDetector, BinaryMarket
+
+        config = NegriskConfig(
+            min_net_edge=0.01,  # 1% minimum net edge
+            fee_rate_bps=0,     # Fee-free market
+            gas_per_leg=0.0,    # No gas costs
+            min_liquidity_per_outcome=50.0,
+        )
+
+        detector = BinaryBundleDetector(config)
+
+        # YES ask=0.45, NO ask=0.50, sum=0.95 → 5% gross edge
+        market = BinaryMarket(
+            market_id="binary_market_1",
+            question="Will it rain tomorrow?",
+            yes_token_id="yes_token_123",
+            no_token_id="no_token_456",
+            yes_bba=OutcomeBBA(best_ask=0.45, ask_size=100.0),
+            no_bba=OutcomeBBA(best_ask=0.50, ask_size=100.0),
+            volume_24h=5000.0,
+            fee_rate_bps=0,
+        )
+
+        opportunity = detector.check_market_buy(market)
+
+        assert opportunity is not None
+        assert opportunity.direction == ArbDirection.BUY_BINARY
+        assert opportunity.sum_of_prices == pytest.approx(0.95, rel=0.01)
+        assert opportunity.gross_edge == pytest.approx(0.05, rel=0.01)
+        assert opportunity.net_edge == pytest.approx(0.05, rel=0.01)  # No fees or gas
+        assert len(opportunity.legs) == 2
+        assert opportunity.legs[0]["side"] == "BUY"
+        assert opportunity.legs[1]["side"] == "BUY"
+        assert opportunity.legs[0]["outcome_name"] == "Yes"
+        assert opportunity.legs[1]["outcome_name"] == "No"
+        assert opportunity.legs[0]["price"] == 0.45
+        assert opportunity.legs[1]["price"] == 0.50
+
+    def test_binary_no_opportunity_sum_above_one(self):
+        """Test that no buy opportunity is detected when sum_asks >= 1.0."""
+        from core.negrisk.binary_detector import BinaryBundleDetector, BinaryMarket
+
+        config = NegriskConfig(
+            min_net_edge=0.01,
+            fee_rate_bps=0,
+            gas_per_leg=0.0,
+        )
+
+        detector = BinaryBundleDetector(config)
+
+        # YES ask=0.55, NO ask=0.50, sum=1.05 → no buy opportunity
+        market = BinaryMarket(
+            market_id="binary_market_2",
+            question="Will it rain tomorrow?",
+            yes_token_id="yes_token_123",
+            no_token_id="no_token_456",
+            yes_bba=OutcomeBBA(best_ask=0.55, ask_size=100.0),
+            no_bba=OutcomeBBA(best_ask=0.50, ask_size=100.0),
+            volume_24h=5000.0,
+            fee_rate_bps=0,
+        )
+
+        opportunity = detector.check_market_buy(market)
+        assert opportunity is None
+
+    def test_binary_sell_opportunity(self):
+        """Test detection of binary sell opportunity when sum_bids > 1.0."""
+        from core.negrisk.binary_detector import BinaryBundleDetector, BinaryMarket
+
+        config = NegriskConfig(
+            min_net_edge=0.01,
+            fee_rate_bps=0,
+            gas_per_leg=0.0,
+            min_liquidity_per_outcome=50.0,
+        )
+
+        detector = BinaryBundleDetector(config)
+
+        # YES bid=0.55, NO bid=0.50, sum=1.05 → 5% sell edge
+        market = BinaryMarket(
+            market_id="binary_market_3",
+            question="Will it rain tomorrow?",
+            yes_token_id="yes_token_123",
+            no_token_id="no_token_456",
+            yes_bba=OutcomeBBA(best_bid=0.55, bid_size=100.0),
+            no_bba=OutcomeBBA(best_bid=0.50, bid_size=100.0),
+            volume_24h=5000.0,
+            fee_rate_bps=0,
+        )
+
+        opportunity = detector.check_market_sell(market)
+
+        assert opportunity is not None
+        assert opportunity.direction == ArbDirection.SELL_BINARY
+        assert opportunity.sum_of_prices == pytest.approx(1.05, rel=0.01)
+        assert opportunity.gross_edge == pytest.approx(0.05, rel=0.01)
+        assert opportunity.net_edge == pytest.approx(0.05, rel=0.01)
+        assert len(opportunity.legs) == 2
+        assert opportunity.legs[0]["side"] == "SELL"
+        assert opportunity.legs[1]["side"] == "SELL"
+        assert opportunity.legs[0]["outcome_name"] == "Yes"
+        assert opportunity.legs[1]["outcome_name"] == "No"
+        assert opportunity.legs[0]["price"] == 0.55
+        assert opportunity.legs[1]["price"] == 0.50
+
+    def test_binary_no_sell_below_one(self):
+        """Test that no sell opportunity is detected when sum_bids <= 1.0."""
+        from core.negrisk.binary_detector import BinaryBundleDetector, BinaryMarket
+
+        config = NegriskConfig(
+            min_net_edge=0.01,
+            fee_rate_bps=0,
+            gas_per_leg=0.0,
+        )
+
+        detector = BinaryBundleDetector(config)
+
+        # YES bid=0.45, NO bid=0.50, sum=0.95 → no sell opportunity
+        market = BinaryMarket(
+            market_id="binary_market_4",
+            question="Will it rain tomorrow?",
+            yes_token_id="yes_token_123",
+            no_token_id="no_token_456",
+            yes_bba=OutcomeBBA(best_bid=0.45, bid_size=100.0),
+            no_bba=OutcomeBBA(best_bid=0.50, bid_size=100.0),
+            volume_24h=5000.0,
+            fee_rate_bps=0,
+        )
+
+        opportunity = detector.check_market_sell(market)
+        assert opportunity is None
+
+    def test_binary_liquidity_check(self):
+        """Test that low liquidity on one side prevents opportunity detection."""
+        from core.negrisk.binary_detector import BinaryBundleDetector, BinaryMarket
+
+        config = NegriskConfig(
+            min_net_edge=0.01,
+            fee_rate_bps=0,
+            gas_per_leg=0.0,
+            min_liquidity_per_outcome=100.0,  # Require at least 100
+        )
+
+        detector = BinaryBundleDetector(config)
+
+        # Good edge but YES has low liquidity
+        market = BinaryMarket(
+            market_id="binary_market_5",
+            question="Will it rain tomorrow?",
+            yes_token_id="yes_token_123",
+            no_token_id="no_token_456",
+            yes_bba=OutcomeBBA(best_ask=0.45, ask_size=50.0),  # Below minimum
+            no_bba=OutcomeBBA(best_ask=0.50, ask_size=200.0),
+            volume_24h=5000.0,
+            fee_rate_bps=0,
+        )
+
+        opportunity = detector.check_market_buy(market)
+        assert opportunity is None
+
+    def test_binary_fee_calculation(self):
+        """Test that fees are correctly calculated for binary markets."""
+        from core.negrisk.binary_detector import BinaryBundleDetector, BinaryMarket
+
+        config = NegriskConfig(
+            min_net_edge=0.01,  # 1% minimum
+            fee_rate_bps=0,     # Will be overridden by market fee
+            gas_per_leg=0.0,
+            min_liquidity_per_outcome=50.0,
+        )
+
+        detector = BinaryBundleDetector(config)
+
+        # Market with fee_rate_bps=1000 (10%)
+        # YES ask=0.45, NO ask=0.50, sum=0.95 → 5% gross edge
+        # BUY fee: (1000/10000) * min(0.45,0.55)/0.45 + (1000/10000) * min(0.50,0.50)/0.50
+        #        = 0.1 * 0.45/0.45 + 0.1 * 0.50/0.50 = 0.1 + 0.1 = 0.2
+        # Net edge = 0.05 - 0.2 = -0.15 → should be rejected
+        market = BinaryMarket(
+            market_id="binary_market_6",
+            question="Will it rain tomorrow?",
+            yes_token_id="yes_token_123",
+            no_token_id="no_token_456",
+            yes_bba=OutcomeBBA(best_ask=0.45, ask_size=100.0),
+            no_bba=OutcomeBBA(best_ask=0.50, ask_size=100.0),
+            volume_24h=5000.0,
+            fee_rate_bps=1000,
+        )
+
+        opportunity = detector.check_market_buy(market)
+        # Should be rejected because net edge is negative
+        assert opportunity is None
+
+    def test_binary_sizing(self):
+        """Test that suggested_size is correctly calculated."""
+        from core.negrisk.binary_detector import BinaryBundleDetector, BinaryMarket
+
+        config = NegriskConfig(
+            min_net_edge=0.01,
+            fee_rate_bps=0,
+            gas_per_leg=0.0,
+            min_liquidity_per_outcome=50.0,
+            max_position_per_event=500.0,
+        )
+
+        detector = BinaryBundleDetector(config)
+
+        # YES ask=0.45, NO ask=0.50, sum=0.95
+        # min_liq = min(120, 150) = 120
+        # max_size_liquidity = 120
+        # max_size_risk = 500 / 0.95 ≈ 526.32
+        # max_size = min(120, 526.32) = 120
+        # suggested_size = 120 * 0.8 = 96
+        market = BinaryMarket(
+            market_id="binary_market_7",
+            question="Will it rain tomorrow?",
+            yes_token_id="yes_token_123",
+            no_token_id="no_token_456",
+            yes_bba=OutcomeBBA(best_ask=0.45, ask_size=120.0),
+            no_bba=OutcomeBBA(best_ask=0.50, ask_size=150.0),
+            volume_24h=5000.0,
+            fee_rate_bps=0,
+        )
+
+        opportunity = detector.check_market_buy(market)
+
+        assert opportunity is not None
+        assert opportunity.max_size == pytest.approx(120.0, rel=0.01)
+        assert opportunity.suggested_size == pytest.approx(96.0, rel=0.01)
+
+    def test_binary_edge_below_threshold(self):
+        """Test that opportunities below edge threshold are rejected."""
+        from core.negrisk.binary_detector import BinaryBundleDetector, BinaryMarket
+
+        config = NegriskConfig(
+            min_net_edge=0.025,  # 2.5% minimum net edge
+            fee_rate_bps=0,
+            gas_per_leg=0.0,
+            min_liquidity_per_outcome=50.0,
+        )
+
+        detector = BinaryBundleDetector(config)
+
+        # Sum=0.99 → 1% gross edge, below 2.5% threshold
+        market = BinaryMarket(
+            market_id="binary_market_8",
+            question="Will it rain tomorrow?",
+            yes_token_id="yes_token_123",
+            no_token_id="no_token_456",
+            yes_bba=OutcomeBBA(best_ask=0.49, ask_size=100.0),
+            no_bba=OutcomeBBA(best_ask=0.50, ask_size=100.0),
+            volume_24h=5000.0,
+            fee_rate_bps=0,
+        )
+
+        opportunity = detector.check_market_buy(market)
+        assert opportunity is None
+
+    def test_binary_with_gas_costs(self):
+        """Test binary arb with gas costs included."""
+        from core.negrisk.binary_detector import BinaryBundleDetector, BinaryMarket
+
+        config = NegriskConfig(
+            min_net_edge=0.01,
+            fee_rate_bps=0,
+            gas_per_leg=0.01,  # $0.01 per leg
+            min_liquidity_per_outcome=50.0,
+        )
+
+        detector = BinaryBundleDetector(config)
+
+        # YES ask=0.45, NO ask=0.50, sum=0.95 → 5% gross edge
+        # Total gas = 0.01 * 2 = 0.02
+        # Suggested size = 80 (80% of min liquidity)
+        # Gas per share = 0.02 / 80 = 0.00025
+        # Net edge = 0.05 - 0.00025 ≈ 0.04975 (well above 1% threshold)
+        market = BinaryMarket(
+            market_id="binary_market_9",
+            question="Will it rain tomorrow?",
+            yes_token_id="yes_token_123",
+            no_token_id="no_token_456",
+            yes_bba=OutcomeBBA(best_ask=0.45, ask_size=100.0),
+            no_bba=OutcomeBBA(best_ask=0.50, ask_size=100.0),
+            volume_24h=5000.0,
+            fee_rate_bps=0,
+        )
+
+        opportunity = detector.check_market_buy(market)
+
+        assert opportunity is not None
+        # Gas impact is minimal with reasonable trade size
+        assert opportunity.net_edge > 0.045
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
