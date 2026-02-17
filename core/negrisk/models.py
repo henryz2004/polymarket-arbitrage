@@ -96,6 +96,12 @@ class NegriskConfig:
     maker_timeout_seconds: float = 30.0        # Cancel unfilled maker orders after this
     maker_min_net_edge: float = 0.015          # Lower threshold for maker (no fee)
 
+    # Event prioritization
+    prioritize_near_resolution: bool = True
+    resolution_window_hours: float = 24.0      # Events resolving within this window get priority
+    priority_edge_discount: float = 0.5        # Multiply min_net_edge by this for high-priority events
+    volume_spike_threshold: float = 2.0        # 2x average volume = spike
+
 
 @dataclass
 class OutcomeBBA:
@@ -241,6 +247,10 @@ class NegriskEvent:
     volume_24h: float = 0.0
     liquidity: float = 0.0
     end_date: Optional[datetime] = None
+
+    # Priority scoring
+    priority_score: float = 0.0              # Higher = more priority (0.0-1.5 range)
+    hours_to_resolution: Optional[float] = None
 
     # Tracking
     last_updated: datetime = field(default_factory=datetime.utcnow)

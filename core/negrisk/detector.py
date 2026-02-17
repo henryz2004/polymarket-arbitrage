@@ -302,10 +302,16 @@ class NegriskDetector:
             "min_liq": round(min_liquidity, 0),
             "size": round(suggested_size, 0),
             "depth_adjusted": depth_adjusted,
+            "priority": round(event.priority_score, 3),
+            "hours_to_resolution": round(event.hours_to_resolution, 1) if event.hours_to_resolution is not None else None,
         })
 
-        # Check minimum net edge (after fees and gas)
-        if net_edge < self.config.min_net_edge:
+        # Check minimum net edge (with priority-based discount)
+        effective_min_edge = self.config.min_net_edge
+        if self.config.prioritize_near_resolution and event.priority_score > 0.5:
+            effective_min_edge = self.config.min_net_edge * self.config.priority_edge_discount
+
+        if net_edge < effective_min_edge:
             self.stats.edge_too_low_rejections += 1
             # Log top candidates so we can sanity-check the fee math
             if gross_edge > 0:
@@ -678,10 +684,16 @@ class NegriskDetector:
             "min_liq": round(min_liquidity, 0),
             "size": round(suggested_size, 0),
             "depth_adjusted": depth_adjusted,
+            "priority": round(event.priority_score, 3),
+            "hours_to_resolution": round(event.hours_to_resolution, 1) if event.hours_to_resolution is not None else None,
         })
 
-        # Check minimum net edge
-        if net_edge < self.config.min_net_edge:
+        # Check minimum net edge (with priority-based discount)
+        effective_min_edge = self.config.min_net_edge
+        if self.config.prioritize_near_resolution and event.priority_score > 0.5:
+            effective_min_edge = self.config.min_net_edge * self.config.priority_edge_discount
+
+        if net_edge < effective_min_edge:
             self.stats.edge_too_low_rejections += 1
             if gross_edge > 0:
                 logger.debug(

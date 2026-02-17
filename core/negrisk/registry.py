@@ -153,6 +153,9 @@ class NegriskRegistry:
             self._token_to_outcome = new_token_map
             self._last_refresh = datetime.utcnow()
 
+            # Calculate priority scores for all events
+            self._calculate_priority_scores()
+
             logger.info(
                 f"Registry refreshed: {len(self._events)} neg-risk events, "
                 f"{len(self._token_to_outcome)} tokens"
@@ -160,6 +163,38 @@ class NegriskRegistry:
 
         except Exception as e:
             logger.error(f"Failed to fetch neg-risk events: {e}")
+
+    def _calculate_priority_scores(self) -> None:
+        """Calculate priority scores for all events based on resolution proximity and volume."""
+        if not self.config.prioritize_near_resolution:
+            return
+
+        # Calculate average volume for spike detection
+        volumes = [e.volume_24h for e in self._events.values() if e.volume_24h > 0]
+        avg_volume = sum(volumes) / len(volumes) if volumes else 0
+
+        now = datetime.utcnow()
+
+        for event in self._events.values():
+            score = 0.0
+
+            # Resolution proximity (0-1 score)
+            if event.end_date:
+                hours_remaining = (event.end_date - now).total_seconds() / 3600
+                event.hours_to_resolution = max(0, hours_remaining)
+
+                if 0 < hours_remaining < self.config.resolution_window_hours:
+                    # Linear ramp: closer to resolution = higher score
+                    proximity = 1.0 - (hours_remaining / self.config.resolution_window_hours)
+                    score += proximity  # 0 to 1.0
+
+            # Volume spike bonus (0-0.5 score)
+            if avg_volume > 0 and event.volume_24h > avg_volume * self.config.volume_spike_threshold:
+                spike_ratio = min(event.volume_24h / avg_volume, 5.0)  # Cap at 5x
+                score += (spike_ratio - self.config.volume_spike_threshold) * 0.25  # Up to 0.75
+                score = min(score, 1.5)  # Cap total score
+
+            event.priority_score = round(score, 3)
 
     def _is_negrisk_event(self, event_data: dict) -> bool:
         """Check if an event is a neg-risk event."""
@@ -202,6 +237,18 @@ class NegriskRegistry:
             # Check for augmented neg-risk (has placeholders)
             neg_risk_augmented = event_data.get("negRiskAugmented", False)
 
+            # Parse end_date from Gamma API response
+            end_date = None
+            end_date_str = event_data.get("endDate") or event_data.get("end_date_iso")
+            if end_date_str:
+                try:
+                    end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                    # Convert to UTC if timezone-aware
+                    if end_date.tzinfo is not None:
+                        end_date = end_date.replace(tzinfo=None)  # Store as naive UTC
+                except (ValueError, TypeError, AttributeError):
+                    pass
+
             event = NegriskEvent(
                 event_id=event_id,
                 slug=event_data.get("slug", ""),
@@ -212,6 +259,7 @@ class NegriskRegistry:
                 neg_risk_augmented=neg_risk_augmented,
                 volume_24h=float(event_data.get("volume24hr", 0) or 0),
                 liquidity=float(event_data.get("liquidity", 0) or 0),
+                end_date=end_date,
                 last_updated=datetime.utcnow(),
             )
 
