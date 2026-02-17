@@ -23,6 +23,8 @@ class ArbDirection(Enum):
     """Direction of a neg-risk arbitrage trade."""
     BUY_ALL = "buy_all"    # Buy YES on all outcomes (sum_asks < $1.00)
     SELL_ALL = "sell_all"  # Sell YES on all outcomes (sum_bids > $1.00)
+    PARTIAL_BUY = "partial_buy"    # Buy YES on subset of outcomes (+EV, not riskless)
+    PARTIAL_SELL = "partial_sell"   # Sell YES on subset of outcomes (+EV, not riskless)
 
 
 @dataclass
@@ -57,6 +59,12 @@ class NegriskConfig:
     # Risk parameters
     max_position_per_event: float = 500.0      # Max $ per event
     skip_augmented_placeholders: bool = True   # Skip unnamed outcomes
+
+    # Partial position parameters (NOT riskless arb, +EV only)
+    enable_partial_positions: bool = False      # Disabled by default
+    min_partial_ev: float = 0.05               # 5% minimum expected value
+    max_excluded_probability: float = 0.15     # Don't exclude outcomes with >15% implied prob
+    partial_kelly_fraction: float = 0.25       # Quarter-Kelly for safety
 
     # Refresh intervals
     registry_refresh_seconds: float = 30.0     # How often to refresh event list
