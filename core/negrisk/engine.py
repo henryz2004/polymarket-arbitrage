@@ -18,8 +18,10 @@ from datetime import datetime
 from typing import Optional
 
 from core.negrisk.bba_tracker import BBATracker
+from core.negrisk.binary_detector import BinaryBundleDetector, BinaryMarket
 from core.negrisk.detector import NegriskDetector
 from core.negrisk.models import ArbDirection, NegriskConfig, NegriskEvent, NegriskOpportunity
+from core.negrisk.partial_detector import PartialPositionDetector
 from core.negrisk.registry import NegriskRegistry
 from core.execution import ExecutionEngine
 from core.risk_manager import RiskManager
@@ -59,6 +61,8 @@ class NegriskEngine:
         self.registry = NegriskRegistry(config)
         self.tracker: Optional[BBATracker] = None
         self.detector = NegriskDetector(config)
+        self.partial_detector = PartialPositionDetector(config)
+        self.binary_detector = BinaryBundleDetector(config)
 
         # Background tasks
         self._scan_task: Optional[asyncio.Task] = None
@@ -183,6 +187,12 @@ class NegriskEngine:
             if sell_opp:
                 await self._execute_opportunity(sell_opp)
 
+            # If no riskless arb found, check for +EV partial positions
+            if not buy_opp and not sell_opp and self.config.enable_partial_positions:
+                partial_opp = self.partial_detector.check_event(event)
+                if partial_opp:
+                    await self._execute_opportunity(partial_opp)
+
         except Exception as e:
             logger.debug(f"Event scan error for {event_id}: {e}")
         finally:
@@ -203,6 +213,23 @@ class NegriskEngine:
             return False
 
         return True
+
+    def _event_to_binary_market(self, event: NegriskEvent) -> Optional[BinaryMarket]:
+        """Convert a 2-outcome NegriskEvent to a BinaryMarket for binary bundle detection."""
+        tradeable = [o for o in event.outcomes if o.is_tradeable(self.config)]
+        if len(tradeable) != 2:
+            return None
+
+        return BinaryMarket(
+            market_id=event.event_id,
+            question=event.title,
+            yes_token_id=tradeable[0].token_id,
+            no_token_id=tradeable[1].token_id,
+            yes_bba=tradeable[0].bba,
+            no_bba=tradeable[1].bba,
+            volume_24h=event.volume_24h,
+            fee_rate_bps=self.config.taker_fee_bps,
+        )
 
     async def _scan_loop(self) -> None:
         """Main scanning loop - periodically check for opportunities."""
@@ -237,6 +264,27 @@ class NegriskEngine:
         # Execute each opportunity
         for opportunity in opportunities:
             await self._execute_opportunity(opportunity)
+
+        # Check binary markets (2-outcome events) for YES+NO bundle arb
+        if self.config.binary_bundle_enabled:
+            for event in events:
+                binary_market = self._event_to_binary_market(event)
+                if binary_market:
+                    buy_opp = self.binary_detector.check_market_buy(binary_market)
+                    if buy_opp:
+                        await self._execute_opportunity(buy_opp)
+                    sell_opp = self.binary_detector.check_market_sell(binary_market)
+                    if sell_opp:
+                        await self._execute_opportunity(sell_opp)
+
+        # Check for +EV partial positions on events with no riskless arb
+        if self.config.enable_partial_positions:
+            arb_event_ids = {opp.event.event_id for opp in opportunities}
+            for event in events:
+                if event.event_id not in arb_event_ids:
+                    partial_opp = self.partial_detector.check_event(event)
+                    if partial_opp:
+                        await self._execute_opportunity(partial_opp)
 
     async def _execute_opportunity(self, opportunity: NegriskOpportunity) -> None:
         """
