@@ -23,6 +23,8 @@ class ArbDirection(Enum):
     """Direction of a neg-risk arbitrage trade."""
     BUY_ALL = "buy_all"    # Buy YES on all outcomes (sum_asks < $1.00)
     SELL_ALL = "sell_all"  # Sell YES on all outcomes (sum_bids > $1.00)
+    BUY_BINARY = "buy_binary"    # Buy YES+NO on single market (sum_asks < $1.00)
+    SELL_BINARY = "sell_binary"  # Sell YES+NO on single market (sum_bids > $1.00)
 
 
 @dataclass
@@ -61,6 +63,9 @@ class NegriskConfig:
     # Refresh intervals
     registry_refresh_seconds: float = 30.0     # How often to refresh event list
     bba_ws_reconnect_delay: float = 1.0        # WebSocket reconnect delay
+
+    # Binary bundle arbitrage
+    binary_bundle_enabled: bool = False        # Enable YES+NO bundle arb on binary markets
 
 
 @dataclass
