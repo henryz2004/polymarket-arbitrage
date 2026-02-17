@@ -86,6 +86,10 @@ class NegriskConfig:
     use_depth_scanning: bool = True            # Use full book depth for edge calculation
     max_book_levels: int = 10                  # Max depth levels to store
 
+    # WebSocket-only mode (Improvement 5)
+    ws_only_mode: bool = False              # Skip CLOB fetch, trust WebSocket data
+    detection_latency_tracking: bool = True  # Track detection latency stats
+
 
 @dataclass
 class OutcomeBBA:
@@ -330,6 +334,7 @@ class NegriskOpportunity:
     detected_at: datetime = field(default_factory=datetime.utcnow)
     expires_at: Optional[datetime] = None
     executed: bool = False
+    detection_latency_ms: float = 0.0  # Time from price update to opportunity detection
 
     # Backward compat alias
     @property
@@ -377,6 +382,9 @@ class NegriskStats:
 
     # Timing stats
     avg_detection_latency_ms: float = 0.0
+    min_detection_latency_ms: float = float('inf')
+    max_detection_latency_ms: float = 0.0
+    total_detections_timed: int = 0
     avg_execution_latency_ms: float = 0.0
 
     # Error tracking

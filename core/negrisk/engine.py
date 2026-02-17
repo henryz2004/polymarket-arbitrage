@@ -13,6 +13,7 @@ Coordinates:
 
 import asyncio
 import logging
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -92,6 +93,11 @@ class NegriskEngine:
         )
         await self.tracker.start()
 
+        # Adjust scan interval for ws_only_mode
+        if self.config.ws_only_mode:
+            self._scan_interval = 30.0  # 30s safety fallback
+            logger.info("WS-only mode: primary detection via WebSocket callbacks")
+
         # Start opportunity scanner
         self._scan_task = asyncio.create_task(
             self._scan_loop(),
@@ -132,17 +138,24 @@ class NegriskEngine:
         if event_id in self._active_event_scans:
             return
 
+        # Record timestamp for latency tracking
+        detection_start = time.monotonic()
+
         # Queue an immediate scan for this specific event
         asyncio.create_task(
-            self._scan_event_for_opportunity(event_id),
+            self._scan_event_for_opportunity(event_id, detection_start=detection_start),
             name=f"scan_event_{event_id}"
         )
 
-    async def _scan_event_for_opportunity(self, event_id: str) -> None:
+    async def _scan_event_for_opportunity(self, event_id: str, detection_start: Optional[float] = None) -> None:
         """
         Scan a specific event for arbitrage opportunity (buy-side and sell-side).
 
         Called by price update callback for low-latency detection.
+
+        Args:
+            event_id: The event to scan
+            detection_start: Timestamp from time.monotonic() for latency tracking
         """
         # Mark this event as being scanned
         self._active_event_scans.add(event_id)
@@ -158,12 +171,12 @@ class NegriskEngine:
                 return
 
             # Detect buy-side opportunity
-            buy_opp = self.detector._check_event(event)
+            buy_opp = self.detector._check_event(event, detection_start=detection_start)
             if buy_opp:
                 await self._execute_opportunity(buy_opp)
 
             # Detect sell-side opportunity
-            sell_opp = self.detector._check_event_sell_side(event)
+            sell_opp = self.detector._check_event_sell_side(event, detection_start=detection_start)
             if sell_opp:
                 await self._execute_opportunity(sell_opp)
 
@@ -221,7 +234,7 @@ class NegriskEngine:
 
         This involves:
         1. Validating the opportunity is still valid
-        2. Fetching fresh prices from CLOB
+        2. Fetching fresh prices from CLOB (unless ws_only_mode)
         3. Creating a bundle signal with all legs
         4. Submitting to execution engine
 
@@ -229,14 +242,26 @@ class NegriskEngine:
         The opportunity should be marked executed when orders actually fill.
         """
         try:
-            # Fetch fresh prices from CLOB for all outcomes
-            if self.tracker:
-                await self.tracker.fetch_all_prices(opportunity.event)
+            if self.config.ws_only_mode:
+                # WS-only mode: skip CLOB fetch and re-validation
+                # Data is already fresh from WebSocket
 
-            # Re-validate with fresh data
-            if not self.detector.validate_opportunity(opportunity):
-                logger.debug(f"Opportunity {opportunity.opportunity_id} failed validation")
-                return
+                # Warn if any outcome has gamma-sourced data (not WebSocket-confirmed)
+                for outcome in opportunity.event.active_outcomes:
+                    if outcome.bba.source == "gamma":
+                        logger.warning(
+                            f"WS-only mode: outcome {outcome.name} has gamma-sourced BBA, "
+                            f"not WebSocket-confirmed"
+                        )
+            else:
+                # Standard mode: fetch fresh prices from CLOB for all outcomes
+                if self.tracker:
+                    await self.tracker.fetch_all_prices(opportunity.event)
+
+                # Re-validate with fresh data
+                if not self.detector.validate_opportunity(opportunity):
+                    logger.debug(f"Opportunity {opportunity.opportunity_id} failed validation")
+                    return
 
             # Create bundle signal
             signal = self._create_negrisk_signal(opportunity)
