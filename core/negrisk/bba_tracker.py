@@ -219,6 +219,12 @@ class BBATracker:
         bid_size = float(bids[0]["size"]) if bids else None
         ask_size = float(asks[0]["size"]) if asks else None
 
+        # Parse full depth
+        from core.negrisk.models import PriceLevel
+        max_levels = self.config.max_book_levels if hasattr(self.config, 'max_book_levels') else 10
+        bid_levels = [PriceLevel(price=float(b["price"]), size=float(b["size"])) for b in bids[:max_levels]]
+        ask_levels = [PriceLevel(price=float(a["price"]), size=float(a["size"])) for a in asks[:max_levels]]
+
         sequence_id = event.get("sequence")
 
         # Update registry
@@ -230,6 +236,8 @@ class BBATracker:
             ask_size=ask_size,
             sequence_id=sequence_id,
             source="websocket",
+            bid_levels=bid_levels,
+            ask_levels=ask_levels,
         )
 
         # Trigger callback

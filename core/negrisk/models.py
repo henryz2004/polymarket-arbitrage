@@ -11,6 +11,13 @@ from enum import Enum
 from typing import Optional
 
 
+@dataclass
+class PriceLevel:
+    """A single price level in the order book."""
+    price: float
+    size: float
+
+
 class OutcomeStatus(Enum):
     """Status of an outcome in a neg-risk event."""
     ACTIVE = "active"           # Normal tradeable outcome
@@ -62,6 +69,10 @@ class NegriskConfig:
     registry_refresh_seconds: float = 30.0     # How often to refresh event list
     bba_ws_reconnect_delay: float = 1.0        # WebSocket reconnect delay
 
+    # Order book depth scanning
+    use_depth_scanning: bool = True            # Use full book depth for edge calculation
+    max_book_levels: int = 10                  # Max depth levels to store
+
 
 @dataclass
 class OutcomeBBA:
@@ -73,6 +84,10 @@ class OutcomeBBA:
     last_updated: datetime = field(default_factory=datetime.utcnow)
     sequence_id: Optional[int] = None
     source: str = "unknown"  # "gamma", "clob", "websocket" — tracks data provenance
+
+    # Full order book depth
+    ask_levels: list = field(default_factory=list)  # list[PriceLevel], full ask depth
+    bid_levels: list = field(default_factory=list)  # list[PriceLevel], full bid depth
 
     @property
     def spread(self) -> Optional[float]:
