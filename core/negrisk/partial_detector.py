@@ -85,9 +85,6 @@ class PartialPositionDetector:
         if len(priced_outcomes) < self.config.min_outcomes:
             return None
 
-        # Sort by ask price ascending (cheapest first)
-        priced_outcomes.sort(key=lambda o: o.bba.best_ask)
-
         # Calculate total implied probability from all asks
         total_ask_sum = sum(o.bba.best_ask for o in priced_outcomes)
 
@@ -99,10 +96,17 @@ class PartialPositionDetector:
         if prob_overrides is not None:
             # Use provided probability overrides
             prob_map = prob_overrides
+            # Sort by value (prob/ask) descending so greedy prefix maximizes EV
+            priced_outcomes.sort(
+                key=lambda o: prob_map.get(o.outcome_id, 0.0) / o.bba.best_ask,
+                reverse=True,
+            )
         else:
             # Default model: mid-price normalization
             # This provides a fairer estimate when spreads are wide
             prob_map = self._compute_mid_price_probabilities(priced_outcomes)
+            # Sort by ask price ascending (cheapest first)
+            priced_outcomes.sort(key=lambda o: o.bba.best_ask)
 
         # Try subsets: include outcomes greedily, find optimal subset
         best_analysis = None
@@ -117,7 +121,7 @@ class PartialPositionDetector:
 
             # Check max excluded probability constraint
             # Don't exclude outcomes that are very likely to win
-            max_excluded_prob = max(o.bba.best_ask for o in excluded)
+            max_excluded_prob = max(prob_map.get(o.outcome_id, 0.0) for o in excluded)
             if max_excluded_prob > self.config.max_excluded_probability:
                 continue
 

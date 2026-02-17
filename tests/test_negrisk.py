@@ -985,12 +985,14 @@ class TestPartialPositions:
             enable_partial_positions=True,
             min_partial_ev=0.05,
             fee_rate_bps=0,  # Fee-free
+            max_excluded_probability=0.50,  # Allow excluding high-prob outcomes for fee testing
         )
 
         config_fee = NegriskConfig(
             enable_partial_positions=True,
             min_partial_ev=0.05,
             fee_rate_bps=1000,  # 10% fee
+            max_excluded_probability=0.50,  # Allow excluding high-prob outcomes for fee testing
         )
 
         from core.negrisk.partial_detector import PartialPositionDetector
