@@ -196,7 +196,7 @@ class BBATracker:
             logger.debug(f"Error processing WebSocket message: {e}")
 
     def _check_sequence(self, token_id: str, sequence_id: int) -> None:
-        """Check for sequence gaps (indicates missed messages)."""
+        """Check for sequence gaps and trigger CLOB refresh if needed."""
         if token_id in self._last_sequence:
             expected = self._last_sequence[token_id] + 1
             gap = sequence_id - expected
@@ -204,7 +204,13 @@ class BBATracker:
                 self._sequence_gaps += 1
                 if gap > self.config.ws_sequence_gap_threshold:
                     logger.warning(
-                        f"Large sequence gap for {token_id}: expected {expected}, got {sequence_id}"
+                        f"Large sequence gap for {token_id}: expected {expected}, got {sequence_id}. "
+                        f"Scheduling CLOB refresh."
+                    )
+                    # Schedule a CLOB fetch to recover missed data
+                    asyncio.create_task(
+                        self._fetch_clob_price(token_id),
+                        name=f"gap_refresh_{token_id[:8]}"
                     )
 
         self._last_sequence[token_id] = sequence_id
@@ -369,6 +375,92 @@ class BBATracker:
         except Exception as e:
             logger.debug(f"CLOB /prices batch fetch error: {e}")
             return {}
+
+    def get_gamma_only_tokens(self) -> list[str]:
+        """
+        Get token IDs that still have only gamma-sourced prices (no CLOB/WebSocket data).
+
+        These are candidates for re-seeding via CLOB fetch.
+        """
+        gamma_tokens = []
+        for event in self.registry.get_all_events():
+            for outcome in event.active_outcomes:
+                if outcome.token_id and outcome.bba.source == "gamma":
+                    gamma_tokens.append(outcome.token_id)
+        return gamma_tokens
+
+    def get_empty_book_tokens(self) -> list[str]:
+        """
+        Get token IDs that have CLOB-sourced data but empty books (no bid/ask).
+
+        These may have become active since last check.
+        """
+        empty_tokens = []
+        for event in self.registry.get_all_events():
+            for outcome in event.active_outcomes:
+                if outcome.token_id and outcome.bba.source in ("clob", "websocket"):
+                    if outcome.bba.best_bid is None and outcome.bba.best_ask is None:
+                        empty_tokens.append(outcome.token_id)
+        return empty_tokens
+
+    async def reseed_gamma_tokens(self) -> dict:
+        """
+        Re-seed tokens that still have gamma-only prices.
+
+        Uses batch /prices for a quick check, then fetches individual /book
+        for tokens where prices have changed or are newly available.
+
+        Returns:
+            Dict with reseed stats: {"checked": N, "reseeded": N, "still_empty": N, "failed": N}
+        """
+        stats = {"checked": 0, "reseeded": 0, "still_empty": 0, "failed": 0}
+
+        gamma_tokens = self.get_gamma_only_tokens()
+        empty_tokens = self.get_empty_book_tokens()
+        all_tokens = list(set(gamma_tokens + empty_tokens))
+
+        if not all_tokens:
+            return stats
+
+        stats["checked"] = len(all_tokens)
+
+        # Batch check prices in chunks of 100
+        batch_size = 100
+        tokens_to_reseed = []
+
+        for i in range(0, len(all_tokens), batch_size):
+            batch = all_tokens[i:i + batch_size]
+            batch_prices = await self.fetch_batch_prices(batch)
+
+            if batch_prices:
+                for token_id in batch:
+                    price_data = batch_prices.get(token_id)
+                    if price_data:
+                        # Token has prices in batch endpoint — worth fetching full book
+                        tokens_to_reseed.append(token_id)
+            else:
+                # Batch endpoint failed — fall back to fetching all individually
+                tokens_to_reseed.extend(batch)
+
+            # Rate limit between batches
+            if i + batch_size < len(all_tokens):
+                await asyncio.sleep(0.2)
+
+        # Fetch individual /book for tokens that need re-seeding
+        for token_id in tokens_to_reseed:
+            try:
+                has_book = await self._fetch_clob_price(token_id)
+                if has_book:
+                    stats["reseeded"] += 1
+                else:
+                    stats["still_empty"] += 1
+            except Exception:
+                stats["failed"] += 1
+
+            # Rate limit individual fetches
+            await asyncio.sleep(0.05)
+
+        return stats
 
     async def stream_price_updates(self) -> AsyncIterator[tuple[str, str]]:
         """

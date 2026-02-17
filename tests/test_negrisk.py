@@ -71,7 +71,7 @@ class TestNegriskModels:
             token_id="t3",
             name="Outcome C",
             status=OutcomeStatus.ACTIVE,
-            bba=OutcomeBBA(best_ask=0.30, ask_size=50.0),  # Below 100 minimum
+            bba=OutcomeBBA(best_ask=0.30, ask_size=20.0),  # Below 50 minimum
         )
         assert not low_liquidity.is_tradeable(config)
 
@@ -2408,8 +2408,8 @@ class TestEventDrivenFocus:
         registry._events = {"e1": event}
         registry._calculate_priority_scores()
 
-        # Expected: proximity = 1 - (6/24) = 0.75
-        assert event.priority_score == pytest.approx(0.75, abs=0.01)
+        # Expected: linear = 1 - (6/24) = 0.75, quadratic = 0.75^2 = 0.5625
+        assert event.priority_score == pytest.approx(0.5625, abs=0.01)
         assert event.hours_to_resolution == pytest.approx(6.0, abs=0.1)
 
     def test_priority_score_far_resolution(self):

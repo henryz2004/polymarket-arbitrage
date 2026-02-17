@@ -295,8 +295,32 @@ class NegriskLongTest:
         )
 
     def _on_price_update(self, event_id: str, token_id: str):
-        """Callback for price updates (no logging -- too frequent)."""
-        pass
+        """
+        Callback for price updates — triggers immediate event-driven scanning.
+
+        Matches NegriskEngine's approach: scan the specific event that updated
+        instead of waiting for the periodic poll.
+        """
+        if not self.registry or not self.detector:
+            return
+
+        event = self.registry.get_event(event_id)
+        if not event:
+            return
+
+        # Check both buy-side and sell-side
+        buy_opp = self.detector._check_event(event)
+        sell_opp = self.detector._check_event_sell_side(event)
+
+        if buy_opp:
+            self.total_opportunities += 1
+            self._log_opportunity(buy_opp)
+            self._categorize_opportunity(buy_opp)
+
+        if sell_opp:
+            self.total_opportunities += 1
+            self._log_opportunity(sell_opp)
+            self._categorize_opportunity(sell_opp)
 
     async def _scan_loop(self):
         """Main scanning loop."""

@@ -66,6 +66,7 @@ class NegriskEngine:
 
         # Background tasks
         self._scan_task: Optional[asyncio.Task] = None
+        self._reseed_task: Optional[asyncio.Task] = None
         self._running = False
 
         # Scan interval
@@ -97,6 +98,9 @@ class NegriskEngine:
         )
         await self.tracker.start()
 
+        # Seed initial CLOB data for all tracked tokens
+        await self._seed_bba_data()
+
         # Adjust scan interval for ws_only_mode
         if self.config.ws_only_mode:
             self._scan_interval = 30.0  # 30s safety fallback
@@ -106,6 +110,12 @@ class NegriskEngine:
         self._scan_task = asyncio.create_task(
             self._scan_loop(),
             name="negrisk_scanner"
+        )
+
+        # Start periodic re-seeding for gamma-only tokens
+        self._reseed_task = asyncio.create_task(
+            self._reseed_loop(),
+            name="negrisk_reseed"
         )
 
         logger.info("NegriskEngine started")
@@ -118,6 +128,13 @@ class NegriskEngine:
             self._scan_task.cancel()
             try:
                 await self._scan_task
+            except asyncio.CancelledError:
+                pass
+
+        if self._reseed_task:
+            self._reseed_task.cancel()
+            try:
+                await self._reseed_task
             except asyncio.CancelledError:
                 pass
 
@@ -242,6 +259,75 @@ class NegriskEngine:
             except Exception as e:
                 logger.error(f"Scan loop error: {e}")
                 await asyncio.sleep(5)
+
+    async def _seed_bba_data(self) -> None:
+        """
+        Seed initial CLOB data for all tracked tokens.
+
+        Fetches order books from CLOB API in batches, sorted by event volume
+        (highest first) for fastest coverage of high-value events.
+        """
+        if not self.tracker:
+            return
+
+        events = self.registry.get_tradeable_events()
+        sorted_events = sorted(events, key=lambda e: e.volume_24h, reverse=True)
+
+        if not sorted_events:
+            logger.warning("No tradeable events found for CLOB seeding")
+            return
+
+        total_tokens = sum(len([o for o in e.active_outcomes if o.token_id]) for e in sorted_events)
+        logger.info(f"Seeding CLOB data for {len(sorted_events)} events ({total_tokens} tokens)")
+
+        batch_size = 10
+        total_seeded = 0
+        total_empty = 0
+        total_failed = 0
+
+        for i in range(0, len(sorted_events), batch_size):
+            batch = sorted_events[i:i + batch_size]
+
+            for event in batch:
+                try:
+                    stats = await self.tracker.fetch_all_prices(event)
+                    total_seeded += stats["seeded"]
+                    total_empty += stats["empty"]
+                    total_failed += stats["failed"]
+                except Exception as e:
+                    logger.debug(f"CLOB seed error for {event.event_id}: {e}")
+
+            # Rate limiting between batches
+            if i + batch_size < len(sorted_events):
+                await asyncio.sleep(0.5)
+
+        logger.info(
+            f"CLOB seeding complete: {total_seeded} tokens with books, "
+            f"{total_empty} empty, {total_failed} failed"
+        )
+
+    async def _reseed_loop(self) -> None:
+        """Periodically re-seed CLOB data for tokens with gamma-only prices."""
+        # Wait for initial seeding to settle
+        await asyncio.sleep(30)
+
+        while self._running:
+            try:
+                if self.tracker:
+                    stats = await self.tracker.reseed_gamma_tokens()
+                    if stats["checked"] > 0:
+                        logger.info(
+                            f"Re-seed: checked={stats['checked']}, "
+                            f"reseeded={stats['reseeded']}, "
+                            f"still_empty={stats['still_empty']}, "
+                            f"failed={stats['failed']}"
+                        )
+                await asyncio.sleep(self.config.reseed_interval_seconds)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Re-seed loop error: {e}")
+                await asyncio.sleep(30)
 
     async def _scan_for_opportunities(self) -> None:
         """Scan all events for arbitrage opportunities."""

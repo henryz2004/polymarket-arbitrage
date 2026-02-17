@@ -165,7 +165,12 @@ class NegriskRegistry:
             logger.error(f"Failed to fetch neg-risk events: {e}")
 
     def _calculate_priority_scores(self) -> None:
-        """Calculate priority scores for all events based on resolution proximity and volume."""
+        """
+        Calculate priority scores for all events based on:
+        1. Resolution proximity — exponential ramp as resolution approaches
+        2. Volume spike — high recent volume signals active trading
+        3. Spread volatility — wide spreads = more price uncertainty = more arb potential
+        """
         if not self.config.prioritize_near_resolution:
             return
 
@@ -178,21 +183,36 @@ class NegriskRegistry:
         for event in self._events.values():
             score = 0.0
 
-            # Resolution proximity (0-1 score)
+            # 1. Resolution proximity (0-1 score, exponential ramp)
             if event.end_date:
                 hours_remaining = (event.end_date - now).total_seconds() / 3600
                 event.hours_to_resolution = max(0, hours_remaining)
 
                 if 0 < hours_remaining < self.config.resolution_window_hours:
-                    # Linear ramp: closer to resolution = higher score
-                    proximity = 1.0 - (hours_remaining / self.config.resolution_window_hours)
-                    score += proximity  # 0 to 1.0
+                    # Exponential ramp: last hours are disproportionately valuable
+                    # At 24h: 0.0, at 12h: 0.25, at 6h: 0.5, at 1h: 0.87, at 0h: 1.0
+                    linear = 1.0 - (hours_remaining / self.config.resolution_window_hours)
+                    score += linear * linear  # Quadratic ramp (0 to 1.0)
 
-            # Volume spike bonus (0-0.5 score)
+            # 2. Volume spike bonus (0-0.5 score)
             if avg_volume > 0 and event.volume_24h > avg_volume * self.config.volume_spike_threshold:
                 spike_ratio = min(event.volume_24h / avg_volume, 5.0)  # Cap at 5x
                 score += (spike_ratio - self.config.volume_spike_threshold) * 0.25  # Up to 0.75
                 score = min(score, 1.5)  # Cap total score
+
+            # 3. Spread volatility — avg spread across active outcomes
+            spreads = []
+            for o in event.active_outcomes:
+                if o.bba.spread is not None:
+                    spreads.append(o.bba.spread)
+            if spreads:
+                avg_spread = sum(spreads) / len(spreads)
+                event.spread_volatility = round(avg_spread, 4)
+                # Wide spreads (>5c avg) add priority — more price uncertainty
+                if avg_spread > 0.05:
+                    spread_bonus = min((avg_spread - 0.05) * 2.0, 0.3)  # Up to 0.3
+                    score += spread_bonus
+                    score = min(score, 1.5)
 
             event.priority_score = round(score, 3)
 

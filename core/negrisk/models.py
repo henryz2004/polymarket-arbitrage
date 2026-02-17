@@ -41,12 +41,12 @@ class NegriskConfig:
     """Configuration for neg-risk arbitrage detection and execution."""
 
     # Detection parameters
-    min_net_edge: float = 0.025          # 2.5% minimum NET edge (after fees & gas)
+    min_net_edge: float = 0.015          # 1.5% minimum NET edge (after fees & gas)
     min_outcomes: int = 3                 # Minimum outcomes for neg-risk event
     max_legs: int = 15                    # Maximum outcomes to trade
 
     # Staleness parameters
-    staleness_ttl_ms: float = 2000.0      # 2 seconds max staleness
+    staleness_ttl_ms: float = 5000.0      # 5 seconds max staleness
     ws_sequence_gap_threshold: int = 5    # Max allowed sequence gaps
 
     # Fee parameters (Polymarket)
@@ -61,8 +61,8 @@ class NegriskConfig:
     gas_per_leg: float = 0.0              # Polymarket covers gas on Polygon
 
     # Execution parameters
-    min_liquidity_per_outcome: float = 100.0   # Min $ liquidity per outcome
-    min_event_volume_24h: float = 10000.0      # Min event 24h volume
+    min_liquidity_per_outcome: float = 50.0     # Min $ liquidity per outcome
+    min_event_volume_24h: float = 5000.0       # Min event 24h volume
     use_fok_orders: bool = True                # Use Fill-or-Kill orders
 
     # Risk parameters
@@ -95,6 +95,14 @@ class NegriskConfig:
     maker_price_offset_bps: float = 0          # Offset from mid-price in bps (0 = at mid)
     maker_timeout_seconds: float = 30.0        # Cancel unfilled maker orders after this
     maker_min_net_edge: float = 0.015          # Lower threshold for maker (no fee)
+
+    # Partial-CLOB tolerance: allow some gamma-only legs
+    max_gamma_only_legs: int = 0          # Max outcomes allowed with gamma-only prices (0 = conservative)
+    gamma_max_spread: float = 0.05        # Max gamma spread to tolerate (5 cents)
+    gamma_max_probability: float = 0.20   # Max implied probability for gamma-only legs (20%)
+
+    # CLOB re-seeding
+    reseed_interval_seconds: float = 300.0  # Re-seed gamma-only tokens every 5 minutes
 
     # Event prioritization
     prioritize_near_resolution: bool = True
@@ -251,6 +259,7 @@ class NegriskEvent:
     # Priority scoring
     priority_score: float = 0.0              # Higher = more priority (0.0-1.5 range)
     hours_to_resolution: Optional[float] = None
+    spread_volatility: float = 0.0           # Avg spread across outcomes (0 = tight, 1 = wide)
 
     # Tracking
     last_updated: datetime = field(default_factory=datetime.utcnow)

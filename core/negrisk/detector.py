@@ -157,6 +157,52 @@ class NegriskDetector:
 
         return opportunities
 
+    def _compute_effective_min_edge(self, event: NegriskEvent, base_min_edge: float) -> float:
+        """
+        Compute effective minimum edge threshold, continuously scaled by priority.
+
+        Higher priority events (near resolution, volatile, high volume) get a
+        lower edge threshold — we want to catch smaller arbs on events that are
+        about to resolve or are actively moving.
+
+        Scaling:
+        - priority_score 0.0 → 100% of base_min_edge (no discount)
+        - priority_score 0.5 → 75% of base_min_edge
+        - priority_score 1.0 → 50% of base_min_edge
+        - priority_score 1.5 → 25% of base_min_edge
+
+        Returns at least 25% of base to avoid accepting noise.
+        """
+        if not self.config.prioritize_near_resolution or event.priority_score <= 0:
+            return base_min_edge
+
+        # Linear interpolation: discount scales from 1.0 (no discount) to 0.25 (max discount)
+        # at priority_score = 1.5
+        discount = max(0.25, 1.0 - event.priority_score * 0.5)
+        return base_min_edge * discount
+
+    def _is_gamma_leg_tolerable_buy(self, outcome, config: NegriskConfig) -> bool:
+        """Check if a gamma-only outcome meets tolerance criteria for buy-side."""
+        if outcome.bba.best_ask is None:
+            return False
+        # Spread check: gamma spread must be tight
+        if outcome.bba.spread is not None and outcome.bba.spread > config.gamma_max_spread:
+            return False
+        # If no spread data, check if ask price implies low probability
+        if outcome.bba.best_ask > config.gamma_max_probability:
+            return False
+        return True
+
+    def _is_gamma_leg_tolerable_sell(self, outcome, config: NegriskConfig) -> bool:
+        """Check if a gamma-only outcome meets tolerance criteria for sell-side."""
+        if outcome.bba.best_bid is None:
+            return False
+        if outcome.bba.spread is not None and outcome.bba.spread > config.gamma_max_spread:
+            return False
+        if outcome.bba.best_bid > config.gamma_max_probability:
+            return False
+        return True
+
     def _check_event(self, event: NegriskEvent, detection_start: Optional[float] = None) -> Optional[NegriskOpportunity]:
         """
         Check a single event for arbitrage opportunity.
@@ -168,6 +214,19 @@ class NegriskDetector:
         # Get tradeable outcomes (includes OTHER, excludes PLACEHOLDER/RESOLVED)
         tradeable = [o for o in event.outcomes if o.is_tradeable(self.config)]
 
+        # Partial-CLOB tolerance: include gamma-only legs that meet criteria
+        gamma_legs = []
+        if self.config.max_gamma_only_legs > 0:
+            non_tradeable = [
+                o for o in event.outcomes
+                if not o.is_tradeable(self.config)
+                and o.status not in (OutcomeStatus.RESOLVED, OutcomeStatus.PLACEHOLDER)
+                and o.bba.source == "gamma"
+                and self._is_gamma_leg_tolerable_buy(o, self.config)
+            ]
+            gamma_legs = non_tradeable[:self.config.max_gamma_only_legs]
+            tradeable = tradeable + gamma_legs
+
         if len(tradeable) < self.config.min_outcomes:
             return None
 
@@ -175,8 +234,9 @@ class NegriskDetector:
             logger.debug(f"Event {event.title} has too many legs: {len(tradeable)}")
             return None
 
-        # Check for stale data
-        if event.has_stale_data(self.config.staleness_ttl_ms):
+        # Check for stale data (only for CLOB-backed outcomes)
+        clob_outcomes = [o for o in tradeable if o not in gamma_legs]
+        if any(o.bba.is_stale(self.config.staleness_ttl_ms) for o in clob_outcomes):
             self.stats.stale_data_rejections += 1
             return None
 
@@ -192,8 +252,9 @@ class NegriskDetector:
         gross_edge = 1.0 - sum_of_asks
 
         # CRITICAL FIX: Check liquidity from tradeable outcomes only
-        ask_sizes = [o.bba.ask_size for o in tradeable if o.bba.ask_size is not None]
-        if not ask_sizes:
+        # Gamma-tolerated legs are exempt from liquidity check (they have no CLOB book)
+        clob_ask_sizes = [o.bba.ask_size for o in tradeable if o.bba.ask_size is not None and o not in gamma_legs]
+        if not clob_ask_sizes and not gamma_legs:
             self.stats.liquidity_rejections += 1
             # Diagnostic: compute edge from ALL priced outcomes, split by source
             all_priced = [o for o in event.outcomes
@@ -221,8 +282,8 @@ class NegriskDetector:
                         )
             return None
 
-        min_liquidity = min(ask_sizes)
-        if min_liquidity < self.config.min_liquidity_per_outcome:
+        min_liquidity = min(clob_ask_sizes) if clob_ask_sizes else self.config.min_liquidity_per_outcome
+        if clob_ask_sizes and min_liquidity < self.config.min_liquidity_per_outcome:
             self.stats.liquidity_rejections += 1
             # Diagnostic: log edge for events rejected on liquidity
             if gross_edge > 0:
@@ -306,10 +367,8 @@ class NegriskDetector:
             "hours_to_resolution": round(event.hours_to_resolution, 1) if event.hours_to_resolution is not None else None,
         })
 
-        # Check minimum net edge (with priority-based discount)
-        effective_min_edge = self.config.min_net_edge
-        if self.config.prioritize_near_resolution and event.priority_score > 0.5:
-            effective_min_edge = self.config.min_net_edge * self.config.priority_edge_discount
+        # Check minimum net edge (continuously scaled by priority)
+        effective_min_edge = self._compute_effective_min_edge(event, self.config.min_net_edge)
 
         if net_edge < effective_min_edge:
             self.stats.edge_too_low_rejections += 1
@@ -320,6 +379,7 @@ class NegriskDetector:
                     f"sum_asks={sum_of_asks:.4f} | gross={gross_edge:.4f} ({gross_edge*100:.2f}%) | "
                     f"fee={fee_per_share:.4f} | gas/sh={gas_per_share:.6f} | "
                     f"net={net_edge:.4f} ({net_edge*100:.2f}%) | "
+                    f"eff_min={effective_min_edge:.4f} | priority={event.priority_score:.3f} | "
                     f"min_liq={min_liquidity:.0f} | size={suggested_size:.0f}"
                 )
             return None
@@ -477,8 +537,9 @@ class NegriskDetector:
             "size": round(suggested_size, 0),
         })
 
-        # Check minimum net edge (use maker threshold)
-        if net_edge < self.config.maker_min_net_edge:
+        # Check minimum net edge (continuously scaled by priority)
+        effective_min_edge = self._compute_effective_min_edge(event, self.config.maker_min_net_edge)
+        if net_edge < effective_min_edge:
             self.stats.edge_too_low_rejections += 1
             if gross_edge > 0:
                 logger.debug(
@@ -486,6 +547,7 @@ class NegriskDetector:
                     f"sum_prices={sum_of_prices:.4f} | gross={gross_edge:.4f} ({gross_edge*100:.2f}%) | "
                     f"fee={fee_per_share:.4f} | gas/sh={gas_per_share:.6f} | "
                     f"net={net_edge:.4f} ({net_edge*100:.2f}%) | "
+                    f"eff_min={effective_min_edge:.4f} | priority={event.priority_score:.3f} | "
                     f"min_liq={min_liquidity:.0f} | size={suggested_size:.0f}"
                 )
             return None
@@ -560,14 +622,28 @@ class NegriskDetector:
         # Get sell-tradeable outcomes (requires bid price and bid liquidity)
         tradeable = [o for o in event.outcomes if o.is_tradeable_sell_side(self.config)]
 
+        # Partial-CLOB tolerance: include gamma-only legs that meet criteria
+        gamma_legs = []
+        if self.config.max_gamma_only_legs > 0:
+            non_tradeable = [
+                o for o in event.outcomes
+                if not o.is_tradeable_sell_side(self.config)
+                and o.status not in (OutcomeStatus.RESOLVED, OutcomeStatus.PLACEHOLDER)
+                and o.bba.source == "gamma"
+                and self._is_gamma_leg_tolerable_sell(o, self.config)
+            ]
+            gamma_legs = non_tradeable[:self.config.max_gamma_only_legs]
+            tradeable = tradeable + gamma_legs
+
         if len(tradeable) < self.config.min_outcomes:
             return None
 
         if len(tradeable) > self.config.max_legs:
             return None
 
-        # Check for stale data
-        if event.has_stale_data(self.config.staleness_ttl_ms):
+        # Check for stale data (only for CLOB-backed outcomes)
+        clob_outcomes = [o for o in tradeable if o not in gamma_legs]
+        if any(o.bba.is_stale(self.config.staleness_ttl_ms) for o in clob_outcomes):
             # Already counted in buy-side, don't double-count
             return None
 
@@ -581,9 +657,9 @@ class NegriskDetector:
         num_legs = len(tradeable)
         gross_edge = sum_of_bids - 1.0
 
-        # Check bid-side liquidity
-        bid_sizes = [o.bba.bid_size for o in tradeable if o.bba.bid_size is not None]
-        if not bid_sizes:
+        # Check bid-side liquidity (gamma-tolerated legs exempt)
+        clob_bid_sizes = [o.bba.bid_size for o in tradeable if o.bba.bid_size is not None and o not in gamma_legs]
+        if not clob_bid_sizes and not gamma_legs:
             self.stats.liquidity_rejections += 1
             # Diagnostic: log sell-side phantom rejects
             all_priced = [o for o in event.outcomes
@@ -608,8 +684,8 @@ class NegriskDetector:
                         )
             return None
 
-        min_liquidity = min(bid_sizes)
-        if min_liquidity < self.config.min_liquidity_per_outcome:
+        min_liquidity = min(clob_bid_sizes) if clob_bid_sizes else self.config.min_liquidity_per_outcome
+        if clob_bid_sizes and min_liquidity < self.config.min_liquidity_per_outcome:
             self.stats.liquidity_rejections += 1
             if gross_edge > 0:
                 now = datetime.utcnow()
@@ -688,10 +764,8 @@ class NegriskDetector:
             "hours_to_resolution": round(event.hours_to_resolution, 1) if event.hours_to_resolution is not None else None,
         })
 
-        # Check minimum net edge (with priority-based discount)
-        effective_min_edge = self.config.min_net_edge
-        if self.config.prioritize_near_resolution and event.priority_score > 0.5:
-            effective_min_edge = self.config.min_net_edge * self.config.priority_edge_discount
+        # Check minimum net edge (continuously scaled by priority)
+        effective_min_edge = self._compute_effective_min_edge(event, self.config.min_net_edge)
 
         if net_edge < effective_min_edge:
             self.stats.edge_too_low_rejections += 1
@@ -701,6 +775,7 @@ class NegriskDetector:
                     f"sum_bids={sum_of_bids:.4f} | gross={gross_edge:.4f} ({gross_edge*100:.2f}%) | "
                     f"fee={fee_per_share:.4f} | gas/sh={gas_per_share:.6f} | "
                     f"net={net_edge:.4f} ({net_edge*100:.2f}%) | "
+                    f"eff_min={effective_min_edge:.4f} | priority={event.priority_score:.3f} | "
                     f"min_liq={min_liquidity:.0f} | size={suggested_size:.0f}"
                 )
             return None
@@ -858,8 +933,9 @@ class NegriskDetector:
             "size": round(suggested_size, 0),
         })
 
-        # Check minimum net edge (use maker threshold)
-        if net_edge < self.config.maker_min_net_edge:
+        # Check minimum net edge (continuously scaled by priority)
+        effective_min_edge = self._compute_effective_min_edge(event, self.config.maker_min_net_edge)
+        if net_edge < effective_min_edge:
             self.stats.edge_too_low_rejections += 1
             if gross_edge > 0:
                 logger.debug(
@@ -867,6 +943,7 @@ class NegriskDetector:
                     f"sum_prices={sum_of_prices:.4f} | gross={gross_edge:.4f} ({gross_edge*100:.2f}%) | "
                     f"fee={fee_per_share:.4f} | gas/sh={gas_per_share:.6f} | "
                     f"net={net_edge:.4f} ({net_edge*100:.2f}%) | "
+                    f"eff_min={effective_min_edge:.4f} | priority={event.priority_score:.3f} | "
                     f"min_liq={min_liquidity:.0f} | size={suggested_size:.0f}"
                 )
             return None
