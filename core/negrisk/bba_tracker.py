@@ -65,6 +65,10 @@ class BBATracker:
         self._last_sequence: dict[str, int] = {}
         self._sequence_gaps: int = 0
 
+        # WebSocket connectivity state
+        self.ws_connected: bool = False
+        self.last_ws_message_at: Optional[datetime] = None
+
         # Stats
         self._ws_messages_received: int = 0
         self._clob_fetches: int = 0
@@ -112,12 +116,15 @@ class BBATracker:
             try:
                 await self._run_websocket()
             except ConnectionClosed as e:
+                self.ws_connected = False
                 logger.warning(f"WebSocket closed: {e}. Reconnecting in {reconnect_delay}s...")
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
             except asyncio.CancelledError:
+                self.ws_connected = False
                 raise
             except Exception as e:
+                self.ws_connected = False
                 logger.error(f"WebSocket error: {e}. Reconnecting in {reconnect_delay}s...")
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
@@ -141,6 +148,7 @@ class BBATracker:
             close_timeout=5,
         ) as ws:
             # Reset reconnect delay on successful connection
+            self.ws_connected = True
             logger.info("WebSocket connected")
 
             # Subscribe to all tokens
@@ -176,6 +184,7 @@ class BBATracker:
 
                 self._ws_messages_received += 1
                 self._last_ws_message = datetime.utcnow()
+                self.last_ws_message_at = self._last_ws_message
 
                 # Check sequence for staleness
                 sequence_id = event.get("sequence")

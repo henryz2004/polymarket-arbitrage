@@ -14,7 +14,7 @@ Coordinates:
 import asyncio
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from core.negrisk.bba_tracker import BBATracker
@@ -74,6 +74,9 @@ class NegriskEngine:
 
         # Track active event scans to prevent unbounded task spawning
         self._active_event_scans: set[str] = set()
+
+        # Per-event execution cooldown to prevent double-execution
+        self._execution_cooldown: dict[str, datetime] = {}
 
         logger.info("NegriskEngine initialized")
 
@@ -213,8 +216,12 @@ class NegriskEngine:
         except Exception as e:
             logger.debug(f"Event scan error for {event_id}: {e}")
         finally:
-            # Always remove from active scans when done
-            self._active_event_scans.discard(event_id)
+            # Keep event in active scans for 500ms after completion
+            # to prevent immediate re-scan from the next WS tick
+            async def _clear_after_delay(eid: str = event_id) -> None:
+                await asyncio.sleep(0.5)
+                self._active_event_scans.discard(eid)
+            asyncio.create_task(_clear_after_delay())
 
     def _is_event_tradeable(self, event: NegriskEvent) -> bool:
         """Check if an event meets basic tradability criteria."""
@@ -386,9 +393,24 @@ class NegriskEngine:
         The opportunity should be marked executed when orders actually fill.
         """
         try:
+            # Per-event execution cooldown to prevent double-execution
+            cooldown_key = f"{opportunity.event.event_id}_{opportunity.direction.value}"
+            now = datetime.utcnow()
+            if cooldown_key in self._execution_cooldown:
+                if now < self._execution_cooldown[cooldown_key]:
+                    logger.debug(f"Execution cooldown active for {cooldown_key}")
+                    return
+            self._execution_cooldown[cooldown_key] = now + timedelta(seconds=5)
+
             if self.config.ws_only_mode:
-                # WS-only mode: skip CLOB fetch and re-validation
-                # Data is already fresh from WebSocket
+                # WS-only mode: skip CLOB fetch but STILL validate
+                if self.tracker and not self.tracker.ws_connected:
+                    logger.warning(f"WS disconnected, skipping execution of {opportunity.opportunity_id}")
+                    return
+
+                if not self.detector.validate_opportunity(opportunity):
+                    logger.debug(f"WS-only: opportunity {opportunity.opportunity_id} failed validation")
+                    return
 
                 # Warn if any outcome has gamma-sourced data (not WebSocket-confirmed)
                 for outcome in opportunity.event.active_outcomes:

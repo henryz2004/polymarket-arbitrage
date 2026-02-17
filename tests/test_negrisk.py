@@ -1736,7 +1736,7 @@ class TestWSOnlyDetection:
 
     @pytest.mark.asyncio
     async def test_ws_only_skips_clob_fetch(self):
-        """Test that ws_only_mode skips CLOB fetch during execution."""
+        """Test that ws_only_mode skips CLOB fetch but still validates."""
         from unittest.mock import AsyncMock, MagicMock
         from core.negrisk.engine import NegriskEngine
         from core.negrisk.bba_tracker import BBATracker
@@ -1760,9 +1760,10 @@ class TestWSOnlyDetection:
         # Create engine
         engine = NegriskEngine(config, execution_engine, risk_manager)
 
-        # Create mock tracker
+        # Create mock tracker with ws_connected=True
         mock_tracker = MagicMock(spec=BBATracker)
         mock_tracker.fetch_all_prices = AsyncMock()
+        mock_tracker.ws_connected = True
         engine.tracker = mock_tracker
 
         # Create an opportunity
@@ -1954,6 +1955,198 @@ class TestWSOnlyDetection:
         # Average should be around 53.33ms (10+50+100)/3
         assert 45 < detector.stats.avg_detection_latency_ms < 65
 
+
+class TestWSOnlyProductionSafety:
+    """Test ws_only_mode production safety fixes."""
+
+    def _make_engine_and_opportunity(self, ws_connected=True):
+        """Helper to create a NegriskEngine with mocks and a valid opportunity."""
+        from unittest.mock import AsyncMock, MagicMock
+        from core.negrisk.engine import NegriskEngine
+        from core.negrisk.bba_tracker import BBATracker
+        from core.execution import ExecutionEngine
+        from core.risk_manager import RiskManager
+
+        config = NegriskConfig(
+            ws_only_mode=True,
+            min_net_edge=0.01,
+            min_outcomes=3,
+            fee_rate_bps=0,
+            gas_per_leg=0.0,
+        )
+
+        execution_engine = MagicMock(spec=ExecutionEngine)
+        execution_engine.submit_signal = AsyncMock()
+        risk_manager = MagicMock(spec=RiskManager)
+
+        engine = NegriskEngine(config, execution_engine, risk_manager)
+
+        mock_tracker = MagicMock(spec=BBATracker)
+        mock_tracker.fetch_all_prices = AsyncMock()
+        mock_tracker.ws_connected = ws_connected
+        engine.tracker = mock_tracker
+
+        event = NegriskEvent(
+            event_id="e1",
+            slug="test-event",
+            title="Test Event",
+            condition_id="c1",
+            volume_24h=20000.0,
+            outcomes=[
+                Outcome(
+                    outcome_id="1", market_id="m1", condition_id="c1",
+                    token_id="t1", name="A",
+                    bba=OutcomeBBA(best_ask=0.30, ask_size=200.0, source="websocket"),
+                ),
+                Outcome(
+                    outcome_id="2", market_id="m2", condition_id="c1",
+                    token_id="t2", name="B",
+                    bba=OutcomeBBA(best_ask=0.30, ask_size=200.0, source="websocket"),
+                ),
+                Outcome(
+                    outcome_id="3", market_id="m3", condition_id="c1",
+                    token_id="t3", name="C",
+                    bba=OutcomeBBA(best_ask=0.30, ask_size=200.0, source="websocket"),
+                ),
+            ],
+        )
+
+        opportunity = NegriskOpportunity(
+            opportunity_id="test_opp",
+            event=event,
+            direction=ArbDirection.BUY_ALL,
+            sum_of_prices=0.90,
+            gross_edge=0.10,
+            net_edge=0.10,
+            suggested_size=100.0,
+            max_size=200.0,
+            legs=[
+                {"token_id": "t1", "market_id": "m1", "outcome_name": "A", "side": "BUY", "price": 0.30, "size": 100.0},
+                {"token_id": "t2", "market_id": "m2", "outcome_name": "B", "side": "BUY", "price": 0.30, "size": 100.0},
+                {"token_id": "t3", "market_id": "m3", "outcome_name": "C", "side": "BUY", "price": 0.30, "size": 100.0},
+            ],
+        )
+
+        return engine, execution_engine, opportunity
+
+    @pytest.mark.asyncio
+    async def test_ws_only_still_validates(self):
+        """Test that ws_only_mode still runs validate_opportunity (Fix 1)."""
+        engine, execution_engine, opportunity = self._make_engine_and_opportunity()
+
+        # Make the opportunity invalid by setting stale data
+        for outcome in opportunity.event.outcomes:
+            outcome.bba.last_updated = datetime(2020, 1, 1)
+
+        # With very short staleness TTL, validation should fail
+        engine.config.staleness_ttl_ms = 1  # 1ms — everything is stale
+
+        await engine._execute_opportunity(opportunity)
+
+        # Signal should NOT have been submitted due to failed validation
+        execution_engine.submit_signal.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_execution_cooldown_prevents_double_execution(self):
+        """Test that execution cooldown prevents same event from executing twice within 5s (Fix 2)."""
+        engine, execution_engine, opportunity = self._make_engine_and_opportunity()
+
+        # First execution should succeed
+        await engine._execute_opportunity(opportunity)
+        assert execution_engine.submit_signal.call_count == 1
+
+        # Second execution of same event+direction should be blocked by cooldown
+        await engine._execute_opportunity(opportunity)
+        assert execution_engine.submit_signal.call_count == 1  # Still 1, not 2
+
+    @pytest.mark.asyncio
+    async def test_execution_cooldown_allows_different_direction(self):
+        """Test that cooldown is keyed on event+direction, not just event."""
+        engine, execution_engine, opportunity = self._make_engine_and_opportunity()
+
+        # BUY_ALL execution
+        await engine._execute_opportunity(opportunity)
+        assert execution_engine.submit_signal.call_count == 1
+
+        # Update BBA for sell-side validation (needs high bids summing > $1.00)
+        for outcome in opportunity.event.outcomes:
+            outcome.bba.best_bid = 0.40
+            outcome.bba.bid_size = 200.0
+
+        # Create SELL_ALL opportunity for same event (sum of bids = 1.20 > 1.00)
+        sell_opp = NegriskOpportunity(
+            opportunity_id="test_opp_sell",
+            event=opportunity.event,
+            direction=ArbDirection.SELL_ALL,
+            sum_of_prices=1.20,
+            gross_edge=0.20,
+            net_edge=0.10,
+            suggested_size=100.0,
+            max_size=200.0,
+            legs=[
+                {"token_id": "t1", "market_id": "m1", "outcome_name": "A", "side": "SELL", "price": 0.40, "size": 100.0},
+                {"token_id": "t2", "market_id": "m2", "outcome_name": "B", "side": "SELL", "price": 0.40, "size": 100.0},
+                {"token_id": "t3", "market_id": "m3", "outcome_name": "C", "side": "SELL", "price": 0.40, "size": 100.0},
+            ],
+        )
+
+        await engine._execute_opportunity(sell_opp)
+        # Should succeed since direction is different
+        assert execution_engine.submit_signal.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_ws_disconnect_blocks_execution(self):
+        """Test that WS disconnect prevents execution in ws_only_mode (Fix 4)."""
+        engine, execution_engine, opportunity = self._make_engine_and_opportunity(ws_connected=False)
+
+        await engine._execute_opportunity(opportunity)
+
+        # Signal should NOT have been submitted due to WS disconnect
+        execution_engine.submit_signal.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_signal_deduplication(self):
+        """Test that duplicate signals are rejected by ExecutionEngine (Fix 3)."""
+        from unittest.mock import AsyncMock, MagicMock
+        from core.execution import ExecutionEngine, ExecutionConfig
+        from core.risk_manager import RiskManager
+        from core.portfolio import Portfolio
+        from polymarket_client.models import Signal
+
+        client = MagicMock()
+        risk_manager = MagicMock(spec=RiskManager)
+        portfolio = MagicMock(spec=Portfolio)
+        config = ExecutionConfig(dry_run=True)
+
+        exec_engine = ExecutionEngine(client, risk_manager, portfolio, config)
+
+        signal = Signal(
+            signal_id="sig_123",
+            action="place_orders",
+            market_id="m1",
+            orders=[],
+            priority=10,
+        )
+
+        # First submit should succeed
+        await exec_engine.submit_signal(signal)
+        assert exec_engine._signal_queue.qsize() == 1
+
+        # Second submit with same signal_id should be rejected
+        await exec_engine.submit_signal(signal)
+        assert exec_engine._signal_queue.qsize() == 1  # Still 1
+
+    def test_bba_tracker_ws_connected_flag(self):
+        """Test that BBATracker has ws_connected flag initialized to False (Fix 4)."""
+        from unittest.mock import MagicMock
+        from core.negrisk.bba_tracker import BBATracker
+
+        registry = MagicMock()
+        config = NegriskConfig()
+        tracker = BBATracker(registry=registry, config=config)
+
+        assert tracker.ws_connected is False
+        assert tracker.last_ws_message_at is None
 
 
 class TestMakerOrders:

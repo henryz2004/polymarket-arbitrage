@@ -86,6 +86,9 @@ class ExecutionEngine:
         # Fill idempotency tracking - prevents duplicate trade processing
         self._processed_trade_ids: set[str] = set()
 
+        # Signal deduplication - prevents duplicate signal submission
+        self._recent_signal_ids: dict[str, datetime] = {}
+
         # Signal queue
         self._signal_queue: asyncio.Queue[Signal] = asyncio.Queue()
         self._processing_task: Optional[asyncio.Task] = None
@@ -126,9 +129,22 @@ class ExecutionEngine:
         logger.info("ExecutionEngine stopped")
     
     async def submit_signal(self, signal: Signal) -> None:
-        """Submit a signal for processing."""
+        """Submit a signal for processing with deduplication."""
+        # Dedup check
+        if signal.signal_id in self._recent_signal_ids:
+            logger.warning(f"Duplicate signal rejected: {signal.signal_id}")
+            return
+        self._recent_signal_ids[signal.signal_id] = datetime.utcnow()
+        self._cleanup_recent_signals()
         await self._signal_queue.put(signal)
         logger.debug(f"Signal queued: {signal.signal_id}")
+
+    def _cleanup_recent_signals(self) -> None:
+        """Remove signal IDs older than 60 seconds."""
+        cutoff = datetime.utcnow() - timedelta(seconds=60)
+        expired = [sid for sid, ts in self._recent_signal_ids.items() if ts < cutoff]
+        for sid in expired:
+            del self._recent_signal_ids[sid]
     
     async def _process_signals(self) -> None:
         """Main signal processing loop."""
