@@ -208,6 +208,10 @@ class NegriskEngine:
         if not events:
             return
 
+        # Sort by priority (highest first) for faster detection of high-value opportunities
+        if self.config.prioritize_near_resolution:
+            events.sort(key=lambda e: e.priority_score, reverse=True)
+
         # Detect opportunities
         opportunities = self.detector.detect_opportunities(events)
 
@@ -363,6 +367,8 @@ class NegriskEngine:
                     "profit": round(opp.expected_profit, 2),
                     "detected": opp.detected_at.isoformat(),
                     "executed": opp.executed,
+                    "priority": round(opp.event.priority_score, 3),
+                    "hours_to_resolution": round(opp.event.hours_to_resolution, 1) if opp.event.hours_to_resolution is not None else None,
                 }
                 for opp in recent_opps[:10]
             ],

@@ -62,6 +62,12 @@ class NegriskConfig:
     registry_refresh_seconds: float = 30.0     # How often to refresh event list
     bba_ws_reconnect_delay: float = 1.0        # WebSocket reconnect delay
 
+    # Event prioritization
+    prioritize_near_resolution: bool = True
+    resolution_window_hours: float = 24.0      # Events resolving within this window get priority
+    priority_edge_discount: float = 0.5        # Multiply min_net_edge by this for high-priority events
+    volume_spike_threshold: float = 2.0        # 2x average volume = spike
+
 
 @dataclass
 class OutcomeBBA:
@@ -203,6 +209,10 @@ class NegriskEvent:
     volume_24h: float = 0.0
     liquidity: float = 0.0
     end_date: Optional[datetime] = None
+
+    # Priority scoring
+    priority_score: float = 0.0              # Higher = more priority (0.0-1.5 range)
+    hours_to_resolution: Optional[float] = None
 
     # Tracking
     last_updated: datetime = field(default_factory=datetime.utcnow)
