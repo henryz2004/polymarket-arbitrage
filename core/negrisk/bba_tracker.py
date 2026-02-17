@@ -68,6 +68,7 @@ class BBATracker:
         # Stats
         self._ws_messages_received: int = 0
         self._clob_fetches: int = 0
+        self._empty_books: int = 0
         self._last_ws_message: Optional[datetime] = None
 
     async def start(self) -> None:
@@ -228,6 +229,7 @@ class BBATracker:
             bid_size=bid_size,
             ask_size=ask_size,
             sequence_id=sequence_id,
+            source="websocket",
         )
 
         # Trigger callback
@@ -252,8 +254,13 @@ class BBATracker:
                 event_obj, outcome = result
                 self.on_price_update(event_obj.event_id, token_id)
 
-    async def _fetch_clob_price(self, token_id: str) -> None:
-        """Fetch fresh price from CLOB API."""
+    async def _fetch_clob_price(self, token_id: str) -> bool:
+        """
+        Fetch fresh price from CLOB API.
+
+        Returns:
+            True if CLOB returned a non-empty book, False otherwise.
+        """
         try:
             resp = await self._http_client.get(
                 f"{self.CLOB_URL}/book",
@@ -261,7 +268,7 @@ class BBATracker:
             )
 
             if resp.status_code != 200:
-                return
+                return False
 
             data = resp.json()
             self._clob_fetches += 1
@@ -274,6 +281,10 @@ class BBATracker:
             bid_size = float(bids[0]["size"]) if bids else None
             ask_size = float(asks[0]["size"]) if asks else None
 
+            has_book = bool(bids or asks)
+            if not has_book:
+                self._empty_books += 1
+
             # Update registry
             self.registry.update_outcome_bba(
                 token_id=token_id,
@@ -281,6 +292,7 @@ class BBATracker:
                 best_ask=best_ask,
                 bid_size=bid_size,
                 ask_size=ask_size,
+                source="clob",
             )
 
             # Trigger callback
@@ -290,18 +302,65 @@ class BBATracker:
                     event_obj, outcome = result
                     self.on_price_update(event_obj.event_id, token_id)
 
+            return has_book
+
         except Exception as e:
             logger.debug(f"CLOB fetch error for {token_id}: {e}")
+            return False
 
-    async def fetch_all_prices(self, event: NegriskEvent) -> None:
-        """Fetch fresh prices from CLOB for all outcomes in an event."""
+    async def fetch_all_prices(self, event: NegriskEvent) -> dict:
+        """
+        Fetch fresh prices from CLOB for all outcomes in an event.
+
+        Returns:
+            Dict with seeding stats: {"seeded": N, "empty": N, "failed": N}
+        """
+        stats = {"seeded": 0, "empty": 0, "failed": 0}
         tasks = []
         for outcome in event.active_outcomes:
             if outcome.token_id:
                 tasks.append(self._fetch_clob_price(outcome.token_id))
 
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    stats["failed"] += 1
+                elif result is True:
+                    stats["seeded"] += 1
+                else:
+                    stats["empty"] += 1
+
+        return stats
+
+    async def fetch_batch_prices(self, token_ids: list[str]) -> dict[str, dict]:
+        """
+        Fetch prices for multiple tokens using CLOB /prices endpoint.
+
+        More efficient than individual /book calls for cross-validation.
+
+        Returns:
+            Dict of token_id -> {"buy": price, "sell": price} or empty dict on failure.
+        """
+        if not token_ids or not self._http_client:
+            return {}
+
+        try:
+            # CLOB /prices accepts a list of token_ids
+            resp = await self._http_client.get(
+                f"{self.CLOB_URL}/prices",
+                params={"token_ids": ",".join(token_ids)},
+            )
+
+            if resp.status_code != 200:
+                logger.debug(f"CLOB /prices returned {resp.status_code}")
+                return {}
+
+            return resp.json()
+
+        except Exception as e:
+            logger.debug(f"CLOB /prices batch fetch error: {e}")
+            return {}
 
     async def stream_price_updates(self) -> AsyncIterator[tuple[str, str]]:
         """
@@ -337,6 +396,7 @@ class BBATracker:
         return {
             "ws_messages": self._ws_messages_received,
             "clob_fetches": self._clob_fetches,
+            "empty_books": self._empty_books,
             "sequence_gaps": self._sequence_gaps,
             "last_ws_message": self._last_ws_message.isoformat() if self._last_ws_message else None,
             "tokens_tracked": len(self._last_sequence),

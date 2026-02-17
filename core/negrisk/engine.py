@@ -18,7 +18,7 @@ from typing import Optional
 
 from core.negrisk.bba_tracker import BBATracker
 from core.negrisk.detector import NegriskDetector
-from core.negrisk.models import NegriskConfig, NegriskEvent, NegriskOpportunity
+from core.negrisk.models import ArbDirection, NegriskConfig, NegriskEvent, NegriskOpportunity
 from core.negrisk.registry import NegriskRegistry
 from core.execution import ExecutionEngine
 from core.risk_manager import RiskManager
@@ -140,7 +140,7 @@ class NegriskEngine:
 
     async def _scan_event_for_opportunity(self, event_id: str) -> None:
         """
-        Scan a specific event for arbitrage opportunity.
+        Scan a specific event for arbitrage opportunity (buy-side and sell-side).
 
         Called by price update callback for low-latency detection.
         """
@@ -157,10 +157,15 @@ class NegriskEngine:
             if not self._is_event_tradeable(event):
                 return
 
-            # Detect opportunity
-            opportunity = self.detector._check_event(event)
-            if opportunity:
-                await self._execute_opportunity(opportunity)
+            # Detect buy-side opportunity
+            buy_opp = self.detector._check_event(event)
+            if buy_opp:
+                await self._execute_opportunity(buy_opp)
+
+            # Detect sell-side opportunity
+            sell_opp = self.detector._check_event_sell_side(event)
+            if sell_opp:
+                await self._execute_opportunity(sell_opp)
 
         except Exception as e:
             logger.debug(f"Event scan error for {event_id}: {e}")
@@ -256,18 +261,20 @@ class NegriskEngine:
         """
         Create a trading signal for a neg-risk opportunity.
 
-        This creates a bundle signal with BUY orders for all outcomes.
-        Each order includes its specific market_id.
+        Supports both BUY_ALL and SELL_ALL directions.
+        Each order includes its specific market_id and side from the leg.
         """
+        is_sell = opportunity.direction == ArbDirection.SELL_ALL
         orders = []
 
         for leg in opportunity.legs:
-            # CRITICAL FIX: Each leg must include its market_id
-            # The execution engine needs this to route the order correctly
+            # Read side from leg - supports both BUY and SELL
+            leg_side = OrderSide.SELL if leg["side"] == "SELL" else OrderSide.BUY
+
             order_spec = {
                 "market_id": leg["market_id"],  # Per-outcome market ID
                 "token_type": TokenType.YES,    # Each outcome has a YES token
-                "side": OrderSide.BUY,
+                "side": leg_side,
                 "price": leg["price"],
                 "size": leg["size"],
                 "strategy_tag": "negrisk_arb",
@@ -275,20 +282,18 @@ class NegriskEngine:
             orders.append(order_spec)
 
         # Create a standard Opportunity object for slippage checking
-        # Use the first outcome's market as the primary market_id
         primary_market_id = opportunity.legs[0]["market_id"] if opportunity.legs else opportunity.event.event_id
 
-        # Create a minimal Opportunity for slippage validation
-        # We'll use the event data to populate the required fields
         from polymarket_client.models import Opportunity as StdOpportunity, OpportunityType
+
+        # SELL_ALL is conceptually a BUNDLE_SHORT (selling all outcomes)
+        opp_type = OpportunityType.BUNDLE_SHORT if is_sell else OpportunityType.BUNDLE_LONG
 
         std_opportunity = StdOpportunity(
             opportunity_id=opportunity.opportunity_id,
-            opportunity_type=OpportunityType.BUNDLE_LONG,  # Buying all outcomes
+            opportunity_type=opp_type,
             market_id=primary_market_id,
             edge=opportunity.net_edge,
-            # For neg-risk, we don't have simple YES/NO bid/ask
-            # Set to None to avoid stale slippage checks - we'll use fresh checks
             best_bid_yes=None,
             best_ask_yes=None,
             best_bid_no=None,
@@ -298,11 +303,12 @@ class NegriskEngine:
             expires_at=opportunity.expires_at,
         )
 
+        direction_label = "SELL-ALL" if is_sell else "BUY-ALL"
         signal = Signal(
             signal_id=opportunity.opportunity_id,
             action="place_orders",
-            market_id=primary_market_id,  # Primary market for signal
-            opportunity=std_opportunity,  # Include opportunity for slippage checks
+            market_id=primary_market_id,
+            opportunity=std_opportunity,
             orders=orders,
             priority=15,  # Highest priority - neg-risk arb is time-sensitive
         )
@@ -349,7 +355,8 @@ class NegriskEngine:
             "recent_opportunities": [
                 {
                     "event": opp.event.title,
-                    "sum_asks": round(opp.sum_of_asks, 4),
+                    "direction": opp.direction.value,
+                    "sum_prices": round(opp.sum_of_prices, 4),
                     "net_edge": round(opp.net_edge, 4),
                     "legs": opp.num_legs,
                     "size": round(opp.suggested_size, 2),

@@ -19,6 +19,12 @@ class OutcomeStatus(Enum):
     RESOLVED = "resolved"       # Already resolved
 
 
+class ArbDirection(Enum):
+    """Direction of a neg-risk arbitrage trade."""
+    BUY_ALL = "buy_all"    # Buy YES on all outcomes (sum_asks < $1.00)
+    SELL_ALL = "sell_all"  # Sell YES on all outcomes (sum_bids > $1.00)
+
+
 @dataclass
 class NegriskConfig:
     """Configuration for neg-risk arbitrage detection and execution."""
@@ -33,8 +39,15 @@ class NegriskConfig:
     ws_sequence_gap_threshold: int = 5    # Max allowed sequence gaps
 
     # Fee parameters (Polymarket)
-    taker_fee_bps: float = 150            # 1.5% taker fee
-    gas_per_leg: float = 0.01             # $0.01 gas per leg (realistic for Polygon)
+    # fee_rate_bps: The feeRateBps value from the CLOB API.
+    # Most neg-risk markets are fee-free (0). Fee-enabled markets (e.g. 15-min crypto) use 1000.
+    # Per-leg fee formula (from CTF Exchange contract):
+    #   SELL: fee = (fee_rate_bps / 10000) * min(price, 1-price) * shares
+    #   BUY:  fee = (fee_rate_bps / 10000) * min(price, 1-price) * shares / price
+    # At p=0.50 with fee_rate_bps=1000: fee = 0.1 * 0.5 = 0.05/share (5%)
+    # Should be fetched dynamically per token in production.
+    fee_rate_bps: float = 0               # Most neg-risk markets are fee-free
+    gas_per_leg: float = 0.0              # Polymarket covers gas on Polygon
 
     # Execution parameters
     min_liquidity_per_outcome: float = 100.0   # Min $ liquidity per outcome
@@ -59,6 +72,7 @@ class OutcomeBBA:
     ask_size: Optional[float] = None
     last_updated: datetime = field(default_factory=datetime.utcnow)
     sequence_id: Optional[int] = None
+    source: str = "unknown"  # "gamma", "clob", "websocket" — tracks data provenance
 
     @property
     def spread(self) -> Optional[float]:
@@ -116,7 +130,7 @@ class Outcome:
 
     def is_tradeable(self, config: NegriskConfig) -> bool:
         """
-        Check if this outcome is tradeable.
+        Check if this outcome is tradeable (buy-side).
 
         CRITICAL: For neg-risk arb, we MUST include "Other" outcomes.
         Skipping "Other" means we don't hold all outcomes and can lose principal.
@@ -136,6 +150,28 @@ class Outcome:
 
         # Must meet minimum liquidity
         if self.bba.ask_size is not None and self.bba.ask_size < config.min_liquidity_per_outcome:
+            return False
+
+        return True
+
+    def is_tradeable_sell_side(self, config: NegriskConfig) -> bool:
+        """
+        Check if this outcome is tradeable for sell-side arb.
+
+        Same status rules as buy-side, but requires bid price and bid liquidity.
+        """
+        if self.status == OutcomeStatus.RESOLVED:
+            return False
+
+        if config.skip_augmented_placeholders and self.status == OutcomeStatus.PLACEHOLDER:
+            return False
+
+        # Must have a bid price (someone willing to buy our YES shares)
+        if self.bba.best_bid is None:
+            return False
+
+        # Must meet minimum bid-side liquidity
+        if self.bba.bid_size is not None and self.bba.bid_size < config.min_liquidity_per_outcome:
             return False
 
         return True
@@ -217,6 +253,14 @@ class NegriskEvent:
             return None
         return min(sizes)
 
+    @property
+    def min_bid_liquidity(self) -> Optional[float]:
+        """Get minimum liquidity across all bids (bottleneck for sell-side sizing)."""
+        sizes = [o.bba.bid_size for o in self.active_outcomes if o.bba.bid_size is not None]
+        if not sizes:
+            return None
+        return min(sizes)
+
     def get_token_ids(self) -> list[str]:
         """Get all token IDs for WebSocket subscription."""
         return [o.token_id for o in self.outcomes if o.token_id]
@@ -231,20 +275,25 @@ class NegriskOpportunity:
     """
     A detected neg-risk arbitrage opportunity.
 
-    Represents a situation where buying YES on all outcomes costs < $1.00,
-    guaranteeing profit when one outcome resolves to YES.
+    BUY_ALL: Buy YES on all outcomes when sum_asks < $1.00.
+    SELL_ALL: Sell YES on all outcomes when sum_bids > $1.00.
+
+    In both cases, exactly one outcome resolves to $1.00, guaranteeing profit.
     """
     opportunity_id: str
     event: NegriskEvent
 
+    # Direction
+    direction: ArbDirection = ArbDirection.BUY_ALL
+
     # Pricing
-    sum_of_asks: float            # Total cost to buy all outcomes
-    gross_edge: float             # 1.0 - sum_of_asks (before fees)
-    net_edge: float               # After fees and gas
+    sum_of_prices: float = 0.0    # sum_of_asks (BUY) or sum_of_bids (SELL)
+    gross_edge: float = 0.0       # |1.0 - sum_of_prices| before fees
+    net_edge: float = 0.0         # After fees and gas
 
     # Sizing
-    suggested_size: float         # Shares to buy of each outcome
-    max_size: float               # Maximum based on liquidity
+    suggested_size: float = 0.0   # Shares per outcome
+    max_size: float = 0.0         # Maximum based on liquidity
 
     # Execution details
     legs: list[dict] = field(default_factory=list)  # Order specs for each leg
@@ -254,10 +303,16 @@ class NegriskOpportunity:
     expires_at: Optional[datetime] = None
     executed: bool = False
 
+    # Backward compat alias
+    @property
+    def sum_of_asks(self) -> float:
+        """Backward compat: returns sum_of_prices."""
+        return self.sum_of_prices
+
     @property
     def total_cost(self) -> float:
         """Total cost to execute this opportunity at suggested size."""
-        return self.sum_of_asks * self.suggested_size
+        return self.sum_of_prices * self.suggested_size
 
     @property
     def expected_profit(self) -> float:
@@ -299,6 +354,7 @@ class NegriskStats:
     # Error tracking
     stale_data_rejections: int = 0
     liquidity_rejections: int = 0
+    edge_too_low_rejections: int = 0
     execution_failures: int = 0
 
     # Best opportunity seen

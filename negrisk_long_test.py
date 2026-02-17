@@ -58,9 +58,13 @@ class DetailedFormatter(logging.Formatter):
 class NegriskLongTest:
     """Long-running neg-risk arbitrage test with detailed logging."""
 
-    def __init__(self, duration_hours: float = 4.0, min_net_edge: float = 0.015):
+    def __init__(self, duration_hours: float = 4.0, min_net_edge: float = 0.015,
+                 min_liquidity_per_outcome: float = 50.0,
+                 min_event_volume_24h: float = 5000.0):
         self.duration = timedelta(hours=duration_hours)
         self.min_net_edge = min_net_edge
+        self.min_liquidity_per_outcome = min_liquidity_per_outcome
+        self.min_event_volume_24h = min_event_volume_24h
         self.start_time = datetime.now()
         self.end_time = self.start_time + self.duration
 
@@ -69,9 +73,10 @@ class NegriskLongTest:
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
         timestamp = self.start_time.strftime("%Y%m%d_%H%M%S")
-        self.log_file = self.log_dir / f"negrisk_test_{timestamp}.log"
-        self.opportunities_file = self.log_dir / f"opportunities_{timestamp}.jsonl"
-        self.stats_file = self.log_dir / f"stats_{timestamp}.jsonl"
+        edge_label = f"{min_net_edge * 100:.1f}pct"
+        self.log_file = self.log_dir / f"negrisk_test_{timestamp}_{edge_label}.log"
+        self.opportunities_file = self.log_dir / f"opportunities_{timestamp}_{edge_label}.jsonl"
+        self.stats_file = self.log_dir / f"stats_{timestamp}_{edge_label}.jsonl"
 
         self._setup_logging()
 
@@ -81,10 +86,10 @@ class NegriskLongTest:
             min_outcomes=3,
             max_legs=15,
             staleness_ttl_ms=60000.0,     # 60 seconds
-            taker_fee_bps=150,
-            gas_per_leg=0.01,
-            min_liquidity_per_outcome=50.0,
-            min_event_volume_24h=5000.0,
+            fee_rate_bps=0,               # Most neg-risk markets are fee-free
+            gas_per_leg=0.0,              # Polymarket covers gas on Polygon
+            min_liquidity_per_outcome=self.min_liquidity_per_outcome,
+            min_event_volume_24h=self.min_event_volume_24h,
             max_position_per_event=500.0,
             skip_augmented_placeholders=True,
         )
@@ -115,11 +120,17 @@ class NegriskLongTest:
         """Setup detailed logging to file and console."""
         # Root logger
         root_logger = logging.getLogger()
-        root_logger.setLevel(logging.DEBUG)
+        root_logger.setLevel(logging.INFO)
 
-        # File handler - everything
+        # Silence noisy third-party loggers (httpx logs every HTTP request)
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
+        logging.getLogger("websockets").setLevel(logging.WARNING)
+        logging.getLogger("asyncio").setLevel(logging.WARNING)
+
+        # File handler - INFO and above (DEBUG generates ~10GB over 12 hours)
         file_handler = logging.FileHandler(self.log_file)
-        file_handler.setLevel(logging.DEBUG)
+        file_handler.setLevel(logging.INFO)
         file_formatter = logging.Formatter(
             '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
@@ -146,6 +157,9 @@ class NegriskLongTest:
         self.logger.info("=" * 80)
         self.logger.info(f"Duration: {self.duration.total_seconds() / 3600:.1f} hours")
         self.logger.info(f"Min Net Edge: {self.min_net_edge * 100:.1f}%")
+        self.logger.info(f"Min Liquidity/Outcome: ${self.min_liquidity_per_outcome:.0f}")
+        self.logger.info(f"Min Event Volume 24h: ${self.min_event_volume_24h:.0f}")
+        self.logger.info(f"Gas Per Leg: ${self.config.gas_per_leg:.2f}")
         self.logger.info(f"Start Time: {self.start_time}")
         self.logger.info(f"End Time: {self.end_time}")
         self.logger.info(f"Log File: {self.log_file}")
@@ -175,7 +189,7 @@ class NegriskLongTest:
         await asyncio.sleep(3)
 
         # Seed initial BBA data
-        self.logger.info("Seeding initial BBA data for top 50 events...")
+        self.logger.info("Seeding initial BBA data for all tradeable events...")
         await self._seed_bba_data()
         self.logger.info("BBA seeding complete")
 
@@ -213,24 +227,76 @@ class NegriskLongTest:
         self._log_final_summary()
 
     async def _seed_bba_data(self):
-        """Seed initial BBA data for top events."""
+        """Seed initial BBA data for all tradeable events with batching and rate limiting."""
         if not self.registry or not self.tracker:
             return
 
-        all_events = self.registry.get_all_events()
+        # Get all tradeable events sorted by volume (highest first)
+        all_events = self.registry.get_tradeable_events()
         sorted_events = sorted(all_events, key=lambda e: e.volume_24h, reverse=True)
-        top_events = sorted_events[:50]
 
-        for event in top_events:
-            try:
-                await self.tracker.fetch_all_prices(event)
-            except Exception as e:
-                self.logger.debug(f"BBA seed error for {event.event_id}: {e}")
+        if not sorted_events:
+            self.logger.warning("No tradeable events found for BBA seeding")
+            return
+
+        total_events = len(sorted_events)
+        total_tokens = sum(len([o for o in e.active_outcomes if o.token_id]) for e in sorted_events)
+        self.logger.info(f"Starting BBA seed for {total_events} events ({total_tokens} tokens)")
+
+        # Process in batches of 10 events with 0.5s delay between batches
+        batch_size = 10
+        seeded_events = 0
+        total_seeded_tokens = 0
+        total_empty_tokens = 0
+        total_failed_tokens = 0
+
+        for i in range(0, total_events, batch_size):
+            batch = sorted_events[i:i + batch_size]
+
+            # Fetch prices for all events in batch concurrently
+            for event in batch:
+                try:
+                    stats = await self.tracker.fetch_all_prices(event)
+                    seeded_events += 1
+                    total_seeded_tokens += stats["seeded"]
+                    total_empty_tokens += stats["empty"]
+                    total_failed_tokens += stats["failed"]
+                except Exception as e:
+                    self.logger.debug(f"BBA seed error for {event.event_id}: {e}")
+
+            # Log progress every 50 events
+            if seeded_events % 50 == 0 or seeded_events == total_events:
+                self.logger.info(
+                    f"Seeded {seeded_events}/{total_events} events | "
+                    f"tokens: {total_seeded_tokens} with books, "
+                    f"{total_empty_tokens} empty, {total_failed_tokens} failed"
+                )
+
+            # Rate limiting: 0.5s delay between batches (unless this is the last batch)
+            if i + batch_size < total_events:
+                await asyncio.sleep(0.5)
+
+        # Summary: count source breakdown across all outcomes
+        source_counts = {"gamma": 0, "clob": 0, "websocket": 0, "unknown": 0}
+        for event in sorted_events:
+            for o in event.active_outcomes:
+                source_counts[o.bba.source] = source_counts.get(o.bba.source, 0) + 1
+
+        self.logger.info(
+            f"BBA source breakdown: clob={source_counts.get('clob', 0)}, "
+            f"websocket={source_counts.get('websocket', 0)}, "
+            f"gamma_only={source_counts.get('gamma', 0)}, "
+            f"unknown={source_counts.get('unknown', 0)}"
+        )
+        self.logger.info(
+            f"CLOB seeding: {total_seeded_tokens} tokens with books, "
+            f"{total_empty_tokens} empty books (truly illiquid), "
+            f"{total_failed_tokens} fetch failures"
+        )
 
     def _on_price_update(self, event_id: str, token_id: str):
-        """Callback for price updates."""
-        # Log at debug level
-        self.logger.debug(f"Price update: event={event_id[:8]}, token={token_id[:8]}")
+        """Callback for price updates (no logging -- too frequent)."""
+        pass
 
     async def _scan_loop(self):
         """Main scanning loop."""
@@ -252,7 +318,6 @@ class NegriskLongTest:
                 self.total_scans += 1
 
                 if not events:
-                    self.logger.debug("No tradeable events")
                     continue
 
                 opportunities = self.detector.detect_opportunities(events)
@@ -264,10 +329,27 @@ class NegriskLongTest:
                         self._log_opportunity(opp)
                         self._categorize_opportunity(opp)
 
-                # Log scan stats every 10 scans
-                if self.total_scans % 10 == 0:
-                    self.logger.debug(f"Scan #{self.total_scans}: {len(events)} events checked, "
-                                    f"{len(opportunities)} opportunities found")
+                # Log scan stats every 100 scans (~3 min at 2s interval)
+                if self.total_scans % 100 == 0:
+                    det_stats = self.detector.get_stats_dict()
+                    self.logger.info(f"Scan #{self.total_scans}: {len(events)} events checked, "
+                                   f"{self.total_opportunities} total opportunities found, "
+                                   f"edge_rejects={det_stats['edge_too_low_rejections']}, "
+                                   f"liq_rejects={det_stats['liquidity_rejections']}")
+
+                    # Log top candidates by gross edge (sanity check)
+                    candidates = self.detector.get_last_scan_candidates()
+                    if candidates:
+                        self.logger.info("Top candidates this scan (by gross edge):")
+                        for c in candidates[:10]:
+                            direction = c.get('direction', 'BUY')
+                            self.logger.info(
+                                f"  [{direction}] {c['title']} | legs={c['legs']} | "
+                                f"sum={c['sum_prices']:.4f} | "
+                                f"gross={c['gross_edge']:.4f} ({c['gross_edge']*100:.2f}%) | "
+                                f"fee={c['fee']:.4f} | gas/sh={c['gas_per_share']:.6f} | "
+                                f"net={c['net_edge']:.4f} ({c['net_edge']*100:.2f}%)"
+                            )
 
             except asyncio.CancelledError:
                 raise
@@ -288,10 +370,14 @@ class NegriskLongTest:
 
     def _log_opportunity(self, opp: NegriskOpportunity):
         """Log an opportunity with full details."""
+        direction = opp.direction.value.upper()
+        price_label = "Sum of Bids" if direction == "SELL_ALL" else "Sum of Asks"
+
         self.logger.info("=" * 80)
-        self.logger.info(f"OPPORTUNITY DETECTED: {opp.opportunity_id}")
+        self.logger.info(f"OPPORTUNITY DETECTED [{direction}]: {opp.opportunity_id}")
         self.logger.info(f"Event: {opp.event.title}")
-        self.logger.info(f"Sum of Asks: {opp.sum_of_asks:.4f}")
+        self.logger.info(f"Direction: {direction}")
+        self.logger.info(f"{price_label}: {opp.sum_of_prices:.4f}")
         self.logger.info(f"Gross Edge: {opp.gross_edge:.4f} ({opp.gross_edge*100:.2f}%)")
         self.logger.info(f"Net Edge: {opp.net_edge:.4f} ({opp.net_edge*100:.2f}%)")
         self.logger.info(f"Legs: {opp.num_legs}")
@@ -303,7 +389,7 @@ class NegriskLongTest:
 
         # Log legs
         for i, leg in enumerate(opp.legs):
-            self.logger.info(f"  Leg {i+1}: {leg['outcome_name'][:50]} @ ${leg['price']:.4f}")
+            self.logger.info(f"  Leg {i+1}: {leg['side']} {leg['outcome_name'][:50]} @ ${leg['price']:.4f}")
 
         self.logger.info("=" * 80)
 
@@ -311,9 +397,10 @@ class NegriskLongTest:
         opp_data = {
             "timestamp": datetime.now().isoformat(),
             "opportunity_id": opp.opportunity_id,
+            "direction": opp.direction.value,
             "event_title": opp.event.title,
             "event_id": opp.event.event_id,
-            "sum_of_asks": opp.sum_of_asks,
+            "sum_of_prices": opp.sum_of_prices,
             "gross_edge": opp.gross_edge,
             "net_edge": opp.net_edge,
             "num_legs": opp.num_legs,
@@ -354,12 +441,14 @@ class NegriskLongTest:
         self.logger.info(f"STATS SNAPSHOT - Runtime: {runtime}")
         self.logger.info(f"Registry: {reg_stats['events_tracked']} events")
         self.logger.info(f"WebSocket: {tracker_stats.get('ws_messages', 0)} messages, "
-                        f"{tracker_stats.get('sequence_gaps', 0)} gaps")
+                        f"{tracker_stats.get('sequence_gaps', 0)} gaps, "
+                        f"{tracker_stats.get('empty_books', 0)} empty books")
         self.logger.info(f"Scans: {self.total_scans}")
         self.logger.info(f"Opportunities Detected: {det_stats['opportunities_detected']}")
         self.logger.info(f"Best Edge: {det_stats['best_edge_seen']:.4f} ({det_stats['best_edge_seen']*100:.2f}%)")
         self.logger.info(f"Rejections - Stale: {det_stats['stale_data_rejections']}, "
-                        f"Liquidity: {det_stats['liquidity_rejections']}")
+                        f"Liquidity: {det_stats['liquidity_rejections']}, "
+                        f"Edge Too Low: {det_stats['edge_too_low_rejections']}")
         self.logger.info("-" * 80)
 
         # Write to stats file
@@ -402,6 +491,7 @@ class NegriskLongTest:
             self.logger.info("Rejections:")
             self.logger.info(f"  Stale Data: {det_stats['stale_data_rejections']}")
             self.logger.info(f"  Low Liquidity: {det_stats['liquidity_rejections']}")
+            self.logger.info(f"  Edge Too Low: {det_stats['edge_too_low_rejections']}")
             self.logger.info(f"  Execution Failures: {det_stats['execution_failures']}")
 
         self.logger.info("=" * 80)
@@ -418,12 +508,18 @@ async def main():
                        help='Test duration in hours (default: 4)')
     parser.add_argument('--edge', type=float, default=1.5,
                        help='Minimum net edge percentage (default: 1.5)')
+    parser.add_argument('--min-liquidity', type=float, default=50.0,
+                       help='Minimum ask liquidity per outcome in $ (default: 50)')
+    parser.add_argument('--min-volume', type=float, default=5000.0,
+                       help='Minimum 24h event volume in $ (default: 5000)')
 
     args = parser.parse_args()
 
     test = NegriskLongTest(
         duration_hours=args.duration,
         min_net_edge=args.edge / 100.0,  # Convert percentage to decimal
+        min_liquidity_per_outcome=args.min_liquidity,
+        min_event_volume_24h=args.min_volume,
     )
 
     try:

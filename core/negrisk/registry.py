@@ -297,6 +297,7 @@ class NegriskRegistry:
                 bba=OutcomeBBA(
                     best_ask=best_ask,
                     last_updated=datetime.utcnow(),
+                    source="gamma",
                 ),
                 volume_24h=float(market_data.get("volume24hr", 0) or 0),
                 liquidity=float(market_data.get("liquidity", 0) or 0),
@@ -368,6 +369,7 @@ class NegriskRegistry:
         bid_size: Optional[float] = None,
         ask_size: Optional[float] = None,
         sequence_id: Optional[int] = None,
+        source: str = "unknown",
     ) -> None:
         """Update BBA for an outcome by token ID."""
         result = self.get_event_by_token(token_id)
@@ -381,6 +383,7 @@ class NegriskRegistry:
         outcome.bba.ask_size = ask_size
         outcome.bba.last_updated = datetime.utcnow()
         outcome.bba.sequence_id = sequence_id
+        outcome.bba.source = source
 
     def get_stats(self) -> dict:
         """Get registry statistics."""

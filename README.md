@@ -47,13 +47,15 @@
 
 - **🔀 Cross-Platform Arbitrage** - Detects price differences between Polymarket and Kalshi for the same prediction
 - **🔍 Bundle Arbitrage Detection** - Identifies when YES + NO prices don't sum to ~$1.00
-- **📊 Market Making** - Captures spreads by placing competitive bid/ask orders  
+- **🎯 Neg-Risk Arbitrage** - Multi-outcome winner-take-all markets where sum of all outcome asks < $1.00
+- **📊 Market Making** - Captures spreads by placing competitive bid/ask orders
 - **🛡️ Risk Management** - Position limits, loss limits, kill switch
 - **📈 Live Dashboard** - Real-time web UI showing opportunities and bot activity
 - **🔄 Dual Data Modes** - Switch between real market data and simulation
 - **💰 Fee Accounting** - Realistic edge calculations including fees & gas costs
 - **📝 Comprehensive Logging** - Detailed logs for trades, opportunities, and errors
 - **🤖 Market Matching AI** - Automatically matches similar predictions across platforms using text similarity
+- **⚛️ Atomic Execution** - Bundle and neg-risk orders execute all-or-nothing with rollback
 
 ---
 
@@ -107,10 +109,16 @@ polymarket-arbitrage/
 ├── core/                     # Trading logic
 │   ├── data_feed.py         # Real-time market data manager
 │   ├── arb_engine.py        # Single-platform opportunity detection
-│   ├── cross_platform_arb.py # Cross-platform arbitrage (NEW!)
-│   ├── execution.py         # Order management
+│   ├── cross_platform_arb.py # Cross-platform arbitrage
+│   ├── execution.py         # Order management (single + atomic bundles)
 │   ├── risk_manager.py      # Risk limits & kill switch
-│   └── portfolio.py         # Position & PnL tracking
+│   ├── portfolio.py         # Position & PnL tracking
+│   └── negrisk/             # Neg-risk multi-outcome arbitrage
+│       ├── models.py        # Data models (events, outcomes, opportunities)
+│       ├── registry.py      # Event discovery from Gamma API
+│       ├── bba_tracker.py   # Real-time BBA via WebSocket + CLOB
+│       ├── detector.py      # Opportunity detection (sum of asks < $1)
+│       └── engine.py        # Orchestrator
 │
 ├── dashboard/                # Web dashboard
 │   ├── server.py            # FastAPI server
@@ -124,9 +132,14 @@ polymarket-arbitrage/
 ├── tests/                    # Unit tests
 │   ├── test_arb_engine.py
 │   ├── test_risk_manager.py
-│   └── test_portfolio.py
+│   ├── test_portfolio.py
+│   └── test_negrisk.py      # Neg-risk arbitrage tests
+│
+├── negrisk_long_test.py      # Long-term neg-risk testing script
+├── NEGRISK_TESTING.md        # Neg-risk testing guide
 │
 └── logs/                     # Log files (auto-created)
+    └── negrisk/              # Neg-risk test logs
 ```
 
 ---
@@ -231,6 +244,24 @@ Detects when the same prediction is priced differently on Polymarket vs Kalshi:
 
 The bot uses **text similarity matching** to automatically find equivalent predictions across platforms.
 
+### Neg-Risk Arbitrage
+
+Exploits mispricing in **multi-outcome winner-take-all markets** (e.g., "Who will win the 2024 election?"). Polymarket's neg-risk adapter allows capital-efficient trading of these events.
+
+| Condition | Action | Profit |
+|-----------|--------|--------|
+| Sum of all outcome asks < $1.00 (after fees) | Buy YES on every outcome | Guaranteed $1 payout when one wins |
+
+**Example**: An event with 5 outcomes priced at $0.28, $0.25, $0.20, $0.10, $0.08 = $0.91 total. Buy all 5 for $0.91, one will resolve to $1.00 = **9% gross edge** (minus 1.5% fees).
+
+**How it works:**
+1. **Registry** discovers neg-risk events from Gamma API (~300 events, ~6000 tokens)
+2. **BBA Tracker** streams real-time prices via WebSocket, seeds initial data from CLOB
+3. **Detector** continuously scans for sum-of-asks < $1.00 - fees
+4. **Engine** executes atomically -- all legs must succeed or all are rolled back
+
+**Key difference from bundle arb**: Bundle arb trades YES+NO on a single binary market. Neg-risk trades YES across *all outcomes* of a multi-outcome event.
+
 ### Bundle Arbitrage
 
 Detects when YES + NO tokens are mispriced within a single platform:
@@ -270,13 +301,29 @@ Places orders inside wide spreads:
 | `risk` | `max_global_exposure` | Max total exposure | 5000 |
 | `risk` | `max_daily_loss` | Stop-loss limit | 500 |
 
+### Neg-Risk Configuration
+
+Neg-risk parameters are defined in `NegriskConfig` (see `core/negrisk/models.py`):
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `min_net_edge` | Min net edge after fees & gas | 0.025 (2.5%) |
+| `min_outcomes` | Min outcomes for event | 3 |
+| `max_legs` | Max outcomes to trade | 15 |
+| `staleness_ttl_ms` | Max BBA data age (ms) | 60000 (60s) |
+| `taker_fee_bps` | Polymarket taker fee | 150 (1.5%) |
+| `gas_per_leg` | Gas cost per leg ($) | 0.05 |
+| `min_liquidity_per_outcome` | Min ask liquidity per outcome ($) | 50 |
+| `min_event_volume_24h` | Min 24h event volume ($) | 5000 |
+| `max_position_per_event` | Max exposure per event ($) | 500 |
+
 ### Fee Configuration
 
 ```yaml
 trading:
   maker_fee_bps: 0            # Polymarket maker fee (0%)
-  taker_fee_bps: 0            # Polymarket taker fee (0%)
-  estimated_gas_per_order: 0.001  # Polygon gas (minimal)
+  taker_fee_bps: 150          # Polymarket taker fee (1.5%)
+  estimated_gas_per_order: 0.001  # Polygon gas (minimal - Polymarket covers gas)
 ```
 
 ### Environment Variables
@@ -299,9 +346,29 @@ pytest tests/ -v
 # Run specific test
 pytest tests/test_arb_engine.py -v
 
+# Run neg-risk tests
+pytest tests/test_negrisk.py -v
+
 # With coverage report
 pytest tests/ --cov=core --cov=polymarket_client
 ```
+
+### Neg-Risk Long-Term Testing
+
+Run the neg-risk detector against live market data to measure opportunity frequency:
+
+```bash
+# 4-hour test (default)
+python negrisk_long_test.py
+
+# 12-hour overnight test
+python negrisk_long_test.py --duration 12 --edge 1.5
+
+# Run in background
+nohup python negrisk_long_test.py --duration 12 > /dev/null 2>&1 &
+```
+
+Logs go to `logs/negrisk/` -- see `NEGRISK_TESTING.md` for full details on analyzing results.
 
 ---
 
@@ -355,7 +422,8 @@ pytest tests/ --cov=core --cov=polymarket_client
 ### Polymarket Notes
 
 - Polymarket uses a **hybrid model**: centralized order matching, on-chain settlement
-- No gas fees for trading (Polymarket covers them)
+- Polymarket covers gas fees for trading on Polygon (the neg-risk module includes a conservative `gas_per_leg` parameter as a safety margin)
+- Taker fee is 1.5% (150 bps); maker fee is 0%
 - Funds are held in USDC on Polygon
 - API keys required for live trading
 
