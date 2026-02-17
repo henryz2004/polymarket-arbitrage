@@ -9,6 +9,7 @@ Sell-side: sum(bids) > $1.00 → sell all outcomes, profit = proceeds - $1.00 pa
 """
 
 import logging
+import time
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional
@@ -119,8 +120,14 @@ class NegriskDetector:
 
         return opportunities
 
-    def _check_event(self, event: NegriskEvent) -> Optional[NegriskOpportunity]:
-        """Check a single event for arbitrage opportunity."""
+    def _check_event(self, event: NegriskEvent, detection_start: Optional[float] = None) -> Optional[NegriskOpportunity]:
+        """
+        Check a single event for arbitrage opportunity.
+
+        Args:
+            event: The event to check
+            detection_start: Timestamp from time.monotonic() for latency tracking
+        """
         # Get tradeable outcomes (includes OTHER, excludes PLACEHOLDER/RESOLVED)
         tradeable = [o for o in event.outcomes if o.is_tradeable(self.config)]
 
@@ -284,6 +291,20 @@ class NegriskDetector:
             expires_at=datetime.utcnow() + timedelta(seconds=5),  # 5s expiry
         )
 
+        # Track detection latency if enabled
+        if detection_start is not None and self.config.detection_latency_tracking:
+            latency_ms = (time.monotonic() - detection_start) * 1000
+            opportunity.detection_latency_ms = latency_ms
+            # Update stats
+            self.stats.total_detections_timed += 1
+            self.stats.max_detection_latency_ms = max(self.stats.max_detection_latency_ms, latency_ms)
+            self.stats.min_detection_latency_ms = min(self.stats.min_detection_latency_ms, latency_ms)
+            # Running average
+            n = self.stats.total_detections_timed
+            self.stats.avg_detection_latency_ms = (
+                self.stats.avg_detection_latency_ms * (n - 1) + latency_ms
+            ) / n
+
         # Track stats
         self.stats.opportunities_detected += 1
         if net_edge > self.stats.best_edge_seen:
@@ -302,13 +323,17 @@ class NegriskDetector:
 
         return opportunity
 
-    def _check_event_sell_side(self, event: NegriskEvent) -> Optional[NegriskOpportunity]:
+    def _check_event_sell_side(self, event: NegriskEvent, detection_start: Optional[float] = None) -> Optional[NegriskOpportunity]:
         """
         Check a single event for sell-side arbitrage opportunity.
 
         If sum_of_bids > $1.00 + fees + gas, selling YES on all outcomes
         guarantees profit. You receive sum_of_bids upfront and pay $1.00
         when one outcome resolves.
+
+        Args:
+            event: The event to check
+            detection_start: Timestamp from time.monotonic() for latency tracking
         """
         # Get sell-tradeable outcomes (requires bid price and bid liquidity)
         tradeable = [o for o in event.outcomes if o.is_tradeable_sell_side(self.config)]
@@ -462,6 +487,20 @@ class NegriskDetector:
             expires_at=datetime.utcnow() + timedelta(seconds=5),
         )
 
+        # Track detection latency if enabled
+        if detection_start is not None and self.config.detection_latency_tracking:
+            latency_ms = (time.monotonic() - detection_start) * 1000
+            opportunity.detection_latency_ms = latency_ms
+            # Update stats
+            self.stats.total_detections_timed += 1
+            self.stats.max_detection_latency_ms = max(self.stats.max_detection_latency_ms, latency_ms)
+            self.stats.min_detection_latency_ms = min(self.stats.min_detection_latency_ms, latency_ms)
+            # Running average
+            n = self.stats.total_detections_timed
+            self.stats.avg_detection_latency_ms = (
+                self.stats.avg_detection_latency_ms * (n - 1) + latency_ms
+            ) / n
+
         # Track stats
         self.stats.opportunities_detected += 1
         if net_edge > self.stats.best_edge_seen:
@@ -587,4 +626,8 @@ class NegriskDetector:
             "best_edge_seen": round(self.stats.best_edge_seen, 4),
             "best_edge_event": self.stats.best_edge_event,
             "recent_opportunities": len(self._recent_opportunities),
+            "avg_detection_latency_ms": round(self.stats.avg_detection_latency_ms, 2),
+            "min_detection_latency_ms": round(self.stats.min_detection_latency_ms, 2) if self.stats.min_detection_latency_ms != float('inf') else None,
+            "max_detection_latency_ms": round(self.stats.max_detection_latency_ms, 2),
+            "total_detections_timed": self.stats.total_detections_timed,
         }

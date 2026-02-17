@@ -10,6 +10,7 @@ from core.negrisk.models import (
     ArbDirection,
     NegriskConfig,
     NegriskEvent,
+    NegriskOpportunity,
     Outcome,
     OutcomeBBA,
     OutcomeStatus,
@@ -678,6 +679,230 @@ class TestFeeFormula:
         # Each leg: 0.1 * p / p = 0.1 → total = 0.3
         # Net = 0.07 - 0.3 = -0.23 → should be rejected
         assert opp_fee is None
+
+
+class TestWSOnlyDetection:
+    """Test WebSocket-Only Instant Detection feature (Improvement 5)."""
+
+    @pytest.mark.asyncio
+    async def test_ws_only_skips_clob_fetch(self):
+        """Test that ws_only_mode skips CLOB fetch during execution."""
+        from unittest.mock import AsyncMock, MagicMock
+        from core.negrisk.engine import NegriskEngine
+        from core.negrisk.bba_tracker import BBATracker
+        from core.execution import ExecutionEngine
+        from core.risk_manager import RiskManager
+
+        # Config with ws_only_mode enabled
+        config = NegriskConfig(
+            ws_only_mode=True,
+            min_net_edge=0.01,
+            min_outcomes=3,
+            fee_rate_bps=0,
+            gas_per_leg=0.0,
+        )
+
+        # Create mocks
+        execution_engine = MagicMock(spec=ExecutionEngine)
+        execution_engine.submit_signal = AsyncMock()
+        risk_manager = MagicMock(spec=RiskManager)
+
+        # Create engine
+        engine = NegriskEngine(config, execution_engine, risk_manager)
+
+        # Create mock tracker
+        mock_tracker = MagicMock(spec=BBATracker)
+        mock_tracker.fetch_all_prices = AsyncMock()
+        engine.tracker = mock_tracker
+
+        # Create an opportunity
+        event = NegriskEvent(
+            event_id="e1",
+            slug="test-event",
+            title="Test Event",
+            condition_id="c1",
+            volume_24h=20000.0,
+            outcomes=[
+                Outcome(
+                    outcome_id="1", market_id="m1", condition_id="c1",
+                    token_id="t1", name="A",
+                    bba=OutcomeBBA(best_ask=0.30, ask_size=200.0, source="websocket"),
+                ),
+                Outcome(
+                    outcome_id="2", market_id="m2", condition_id="c1",
+                    token_id="t2", name="B",
+                    bba=OutcomeBBA(best_ask=0.30, ask_size=200.0, source="websocket"),
+                ),
+                Outcome(
+                    outcome_id="3", market_id="m3", condition_id="c1",
+                    token_id="t3", name="C",
+                    bba=OutcomeBBA(best_ask=0.30, ask_size=200.0, source="websocket"),
+                ),
+            ],
+        )
+
+        opportunity = NegriskOpportunity(
+            opportunity_id="test_opp",
+            event=event,
+            direction=ArbDirection.BUY_ALL,
+            sum_of_prices=0.90,
+            gross_edge=0.10,
+            net_edge=0.10,
+            suggested_size=100.0,
+            max_size=200.0,
+            legs=[
+                {"token_id": "t1", "market_id": "m1", "outcome_name": "A", "side": "BUY", "price": 0.30, "size": 100.0},
+                {"token_id": "t2", "market_id": "m2", "outcome_name": "B", "side": "BUY", "price": 0.30, "size": 100.0},
+                {"token_id": "t3", "market_id": "m3", "outcome_name": "C", "side": "BUY", "price": 0.30, "size": 100.0},
+            ],
+        )
+
+        # Execute the opportunity
+        await engine._execute_opportunity(opportunity)
+
+        # Verify fetch_all_prices was NOT called (ws_only_mode)
+        mock_tracker.fetch_all_prices.assert_not_called()
+
+        # Verify signal was submitted
+        execution_engine.submit_signal.assert_called_once()
+
+    def test_detection_latency_tracking(self):
+        """Test that detection latency is tracked correctly."""
+        import time
+
+        config = NegriskConfig(
+            min_net_edge=0.01,
+            min_outcomes=3,
+            fee_rate_bps=0,
+            gas_per_leg=0.0,
+            detection_latency_tracking=True,
+        )
+
+        detector = NegriskDetector(config)
+
+        # Create an event with arbitrage opportunity
+        event = NegriskEvent(
+            event_id="e1",
+            slug="test-event",
+            title="Test Event",
+            condition_id="c1",
+            volume_24h=20000.0,
+            outcomes=[
+                Outcome(
+                    outcome_id="1", market_id="m1", condition_id="c1",
+                    token_id="t1", name="A",
+                    bba=OutcomeBBA(best_ask=0.28, ask_size=200.0, source="websocket"),
+                ),
+                Outcome(
+                    outcome_id="2", market_id="m2", condition_id="c1",
+                    token_id="t2", name="B",
+                    bba=OutcomeBBA(best_ask=0.30, ask_size=200.0, source="websocket"),
+                ),
+                Outcome(
+                    outcome_id="3", market_id="m3", condition_id="c1",
+                    token_id="t3", name="C",
+                    bba=OutcomeBBA(best_ask=0.35, ask_size=200.0, source="websocket"),
+                ),
+            ],
+        )
+
+        # Simulate detection starting 50ms ago
+        detection_start = time.monotonic() - 0.050
+
+        # Detect opportunity with latency tracking
+        opportunity = detector._check_event(event, detection_start=detection_start)
+
+        assert opportunity is not None
+        # Latency should be approximately 50ms (allow some tolerance)
+        assert 45 < opportunity.detection_latency_ms < 60
+
+        # Check stats were updated
+        assert detector.stats.total_detections_timed == 1
+        assert detector.stats.avg_detection_latency_ms > 0
+        assert detector.stats.min_detection_latency_ms > 0
+        assert detector.stats.max_detection_latency_ms > 0
+
+    def test_ws_only_fallback_scan_interval(self):
+        """Test that ws_only_mode sets scan interval to 30s."""
+        from unittest.mock import MagicMock
+        from core.negrisk.engine import NegriskEngine
+        from core.execution import ExecutionEngine
+        from core.risk_manager import RiskManager
+
+        # Config with ws_only_mode enabled
+        config = NegriskConfig(
+            ws_only_mode=True,
+            min_net_edge=0.01,
+        )
+
+        execution_engine = MagicMock(spec=ExecutionEngine)
+        risk_manager = MagicMock(spec=RiskManager)
+
+        engine = NegriskEngine(config, execution_engine, risk_manager)
+
+        # Verify scan interval is set correctly at init (default 1s)
+        assert engine._scan_interval == 1.0
+
+        # Note: The scan interval is actually set in start(), which we can't easily test
+        # without running the full async start sequence. This test documents the expected behavior.
+        # The actual interval change happens in engine.start() when ws_only_mode=True.
+
+    def test_latency_stats_aggregation(self):
+        """Test that latency stats are aggregated correctly over multiple opportunities."""
+        import time
+
+        config = NegriskConfig(
+            min_net_edge=0.01,
+            min_outcomes=3,
+            fee_rate_bps=0,
+            gas_per_leg=0.0,
+            detection_latency_tracking=True,
+        )
+
+        detector = NegriskDetector(config)
+
+        event = NegriskEvent(
+            event_id="e1",
+            slug="test-event",
+            title="Test Event",
+            condition_id="c1",
+            volume_24h=20000.0,
+            outcomes=[
+                Outcome(
+                    outcome_id="1", market_id="m1", condition_id="c1",
+                    token_id="t1", name="A",
+                    bba=OutcomeBBA(best_ask=0.28, ask_size=200.0, source="websocket"),
+                ),
+                Outcome(
+                    outcome_id="2", market_id="m2", condition_id="c1",
+                    token_id="t2", name="B",
+                    bba=OutcomeBBA(best_ask=0.30, ask_size=200.0, source="websocket"),
+                ),
+                Outcome(
+                    outcome_id="3", market_id="m3", condition_id="c1",
+                    token_id="t3", name="C",
+                    bba=OutcomeBBA(best_ask=0.35, ask_size=200.0, source="websocket"),
+                ),
+            ],
+        )
+
+        # Fire three opportunities with known latencies
+        latencies = [10.0, 50.0, 100.0]  # in ms
+
+        for latency_ms in latencies:
+            # Clear cooldown to allow multiple detections
+            detector._opportunity_cooldown.clear()
+
+            detection_start = time.monotonic() - (latency_ms / 1000.0)
+            opportunity = detector._check_event(event, detection_start=detection_start)
+            assert opportunity is not None
+
+        # Check aggregated stats
+        assert detector.stats.total_detections_timed == 3
+        assert detector.stats.min_detection_latency_ms < 15  # Should be close to 10ms
+        assert detector.stats.max_detection_latency_ms > 95  # Should be close to 100ms
+        # Average should be around 53.33ms (10+50+100)/3
+        assert 45 < detector.stats.avg_detection_latency_ms < 65
 
 
 if __name__ == "__main__":

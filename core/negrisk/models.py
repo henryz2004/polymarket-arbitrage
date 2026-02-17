@@ -62,6 +62,10 @@ class NegriskConfig:
     registry_refresh_seconds: float = 30.0     # How often to refresh event list
     bba_ws_reconnect_delay: float = 1.0        # WebSocket reconnect delay
 
+    # WebSocket-only mode (Improvement 5)
+    ws_only_mode: bool = False              # Skip CLOB fetch, trust WebSocket data
+    detection_latency_tracking: bool = True  # Track detection latency stats
+
 
 @dataclass
 class OutcomeBBA:
@@ -302,6 +306,7 @@ class NegriskOpportunity:
     detected_at: datetime = field(default_factory=datetime.utcnow)
     expires_at: Optional[datetime] = None
     executed: bool = False
+    detection_latency_ms: float = 0.0  # Time from price update to opportunity detection
 
     # Backward compat alias
     @property
@@ -349,6 +354,9 @@ class NegriskStats:
 
     # Timing stats
     avg_detection_latency_ms: float = 0.0
+    min_detection_latency_ms: float = float('inf')
+    max_detection_latency_ms: float = 0.0
+    total_detections_timed: int = 0
     avg_execution_latency_ms: float = 0.0
 
     # Error tracking
