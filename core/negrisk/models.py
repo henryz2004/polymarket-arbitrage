@@ -90,6 +90,12 @@ class NegriskConfig:
     ws_only_mode: bool = False              # Skip CLOB fetch, trust WebSocket data
     detection_latency_tracking: bool = True  # Track detection latency stats
 
+    # Order strategy (maker vs taker)
+    order_strategy: str = "taker"              # "taker" or "maker"
+    maker_price_offset_bps: float = 0          # Offset from mid-price in bps (0 = at mid)
+    maker_timeout_seconds: float = 30.0        # Cancel unfilled maker orders after this
+    maker_min_net_edge: float = 0.015          # Lower threshold for maker (no fee)
+
 
 @dataclass
 class OutcomeBBA:
@@ -368,6 +374,23 @@ class NegriskOpportunity:
         if self.event.has_stale_data(config.staleness_ttl_ms):
             return False
         return True
+
+
+@dataclass
+class MakerOrderState:
+    """Tracks state of a pending maker order leg."""
+    opportunity_id: str
+    leg_index: int
+    token_id: str
+    market_id: str
+    side: str                    # "BUY" or "SELL"
+    price: float
+    size: float
+    order_id: Optional[str] = None
+    filled: bool = False
+    filled_size: float = 0.0
+    placed_at: Optional[datetime] = None
+    cancelled: bool = False
 
 
 @dataclass
