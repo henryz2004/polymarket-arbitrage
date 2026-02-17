@@ -88,12 +88,13 @@ class NegriskDetector:
         # Diagnostic: throttle LIQ_REJECT logs (one per event per 60s)
         self._liq_reject_log_cooldown: dict[str, datetime] = {}
 
-    def detect_opportunities(self, events: list[NegriskEvent]) -> list[NegriskOpportunity]:
+    def detect_opportunities(self, events: list[NegriskEvent], strategy: str = "taker") -> list[NegriskOpportunity]:
         """
         Scan all events for arbitrage opportunities (both buy-side and sell-side).
 
         Args:
             events: List of neg-risk events to scan
+            strategy: "taker" (cross spread) or "maker" (price at mid)
 
         Returns:
             List of detected opportunities
@@ -103,17 +104,21 @@ class NegriskDetector:
         self._last_scan_candidates: list[dict] = []
 
         for event in events:
-            # Buy-side: sum_asks < $1.00
-            buy_opp = self._check_event(event)
+            if strategy == "maker":
+                # Maker mode: price at mid-price
+                buy_opp = self._check_event_maker(event)
+                sell_opp = self._check_event_maker_sell_side(event)
+            else:
+                # Taker mode: cross the spread
+                buy_opp = self._check_event(event)
+                sell_opp = self._check_event_sell_side(event)
+
             if buy_opp:
                 opportunities.append(buy_opp)
-
-            # Sell-side: sum_bids > $1.00
-            sell_opp = self._check_event_sell_side(event)
             if sell_opp:
                 opportunities.append(sell_opp)
 
-        # Sort candidates by gross_edge descending, keep top 10 (5 buy + 5 sell)
+        # Sort candidates by gross_edge descending, keep top 10
         self._last_scan_candidates.sort(key=lambda c: c["gross_edge"], reverse=True)
         self._last_scan_candidates = self._last_scan_candidates[:10]
 
@@ -302,6 +307,159 @@ class NegriskDetector:
 
         return opportunity
 
+    def _check_event_maker(self, event: NegriskEvent) -> Optional[NegriskOpportunity]:
+        """
+        Check a single event for maker-mode buy-side opportunity.
+
+        Prices at mid-price (between bid and ask) instead of crossing the spread.
+        Maker orders pay 0% fee on Polymarket.
+        """
+        # Get tradeable outcomes (includes OTHER, excludes PLACEHOLDER/RESOLVED)
+        tradeable = [o for o in event.outcomes if o.is_tradeable(self.config)]
+
+        if len(tradeable) < self.config.min_outcomes:
+            return None
+
+        if len(tradeable) > self.config.max_legs:
+            logger.debug(f"Event {event.title} has too many legs: {len(tradeable)}")
+            return None
+
+        # Check for stale data
+        if event.has_stale_data(self.config.staleness_ttl_ms):
+            self.stats.stale_data_rejections += 1
+            return None
+
+        # Calculate maker prices at mid-price with optional offset
+        maker_prices = []
+        for o in tradeable:
+            if o.bba.best_bid is None or o.bba.best_ask is None:
+                return None
+
+            mid = (o.bba.best_bid + o.bba.best_ask) / 2
+            # Apply offset (positive offset = more aggressive = closer to ask)
+            offset = self.config.maker_price_offset_bps / 10000.0
+            maker_price = mid + offset
+            # Cap at best_ask (don't pay more than crossing)
+            maker_price = min(maker_price, o.bba.best_ask)
+            # Round to 2 decimal places (Polymarket uses cents)
+            maker_prices.append(round(maker_price, 2))
+
+        sum_of_prices = sum(maker_prices)
+        num_legs = len(tradeable)
+        gross_edge = 1.0 - sum_of_prices
+
+        # Check liquidity from tradeable outcomes only
+        ask_sizes = [o.bba.ask_size for o in tradeable if o.bba.ask_size is not None]
+        if not ask_sizes:
+            self.stats.liquidity_rejections += 1
+            return None
+
+        min_liquidity = min(ask_sizes)
+        if min_liquidity < self.config.min_liquidity_per_outcome:
+            self.stats.liquidity_rejections += 1
+            return None
+
+        # Calculate sizing
+        max_size_liquidity = min_liquidity
+        max_size_risk = self.config.max_position_per_event / sum_of_prices if sum_of_prices > 0 else 0
+        max_size = min(max_size_liquidity, max_size_risk)
+        suggested_size = max_size * 0.8  # Use 80% of max for safety
+
+        if suggested_size <= 0:
+            return None
+
+        # Gas per share (amortized over trade size)
+        total_gas_cost = self.config.gas_per_leg * num_legs
+        gas_per_share = total_gas_cost / suggested_size if suggested_size > 0 else total_gas_cost
+
+        # Maker fee = 0 on Polymarket
+        fee_per_share = 0.0
+
+        # Net edge (all per-share metrics)
+        net_edge = gross_edge - fee_per_share - gas_per_share
+
+        # Track candidate for diagnostics
+        self._last_scan_candidates.append({
+            "title": event.title[:60],
+            "direction": "BUY(maker)",
+            "legs": num_legs,
+            "sum_prices": round(sum_of_prices, 4),
+            "gross_edge": round(gross_edge, 4),
+            "fee": round(fee_per_share, 4),
+            "gas_per_share": round(gas_per_share, 6),
+            "net_edge": round(net_edge, 4),
+            "min_liq": round(min_liquidity, 0),
+            "size": round(suggested_size, 0),
+        })
+
+        # Check minimum net edge (use maker threshold)
+        if net_edge < self.config.maker_min_net_edge:
+            self.stats.edge_too_low_rejections += 1
+            if gross_edge > 0:
+                logger.debug(
+                    f"MAKER_EDGE_REJECT: {event.title[:60]} | legs={num_legs} | "
+                    f"sum_prices={sum_of_prices:.4f} | gross={gross_edge:.4f} ({gross_edge*100:.2f}%) | "
+                    f"fee={fee_per_share:.4f} | gas/sh={gas_per_share:.6f} | "
+                    f"net={net_edge:.4f} ({net_edge*100:.2f}%) | "
+                    f"min_liq={min_liquidity:.0f} | size={suggested_size:.0f}"
+                )
+            return None
+
+        # Check cooldown to avoid spam
+        cooldown_key = event.event_id
+        if cooldown_key in self._opportunity_cooldown:
+            if datetime.utcnow() < self._opportunity_cooldown[cooldown_key]:
+                return None
+
+        self._opportunity_cooldown[cooldown_key] = datetime.utcnow() + timedelta(seconds=2)
+
+        # Build leg specifications with maker prices
+        legs = []
+        for i, outcome in enumerate(tradeable):
+            leg = {
+                "token_id": outcome.token_id,
+                "market_id": outcome.market_id,
+                "outcome_name": outcome.name,
+                "side": "BUY",
+                "price": maker_prices[i],
+                "size": suggested_size,
+                "order_type": "maker",  # Flag for execution engine
+            }
+            legs.append(leg)
+
+        # Create opportunity
+        opportunity = NegriskOpportunity(
+            opportunity_id=f"negrisk_maker_{uuid.uuid4().hex[:12]}",
+            event=event,
+            direction=ArbDirection.BUY_ALL,
+            sum_of_prices=sum_of_prices,
+            gross_edge=gross_edge,
+            net_edge=net_edge,
+            suggested_size=suggested_size,
+            max_size=max_size,
+            legs=legs,
+            detected_at=datetime.utcnow(),
+            expires_at=datetime.utcnow() + timedelta(seconds=5),  # 5s expiry
+        )
+
+        # Track stats
+        self.stats.opportunities_detected += 1
+        if net_edge > self.stats.best_edge_seen:
+            self.stats.best_edge_seen = net_edge
+            self.stats.best_edge_event = event.title
+
+        # Cache opportunity
+        self._recent_opportunities[opportunity.opportunity_id] = opportunity
+
+        logger.info(
+            f"BUY-ALL(maker) opportunity: {event.title[:40]} | "
+            f"sum_prices={sum_of_prices:.4f} | gross={gross_edge:.4f} | "
+            f"fees={fee_per_share:.4f} | gas/share={gas_per_share:.6f} | "
+            f"NET edge={net_edge:.4f} | legs={num_legs} | size={suggested_size:.2f}"
+        )
+
+        return opportunity
+
     def _check_event_sell_side(self, event: NegriskEvent) -> Optional[NegriskOpportunity]:
         """
         Check a single event for sell-side arbitrage opportunity.
@@ -474,6 +632,159 @@ class NegriskDetector:
         logger.info(
             f"SELL-ALL opportunity: {event.title[:40]} | "
             f"sum_bids={sum_of_bids:.4f} | gross={gross_edge:.4f} | "
+            f"fees={fee_per_share:.4f} | gas/share={gas_per_share:.6f} | "
+            f"NET edge={net_edge:.4f} | legs={num_legs} | size={suggested_size:.2f}"
+        )
+
+        return opportunity
+
+    def _check_event_maker_sell_side(self, event: NegriskEvent) -> Optional[NegriskOpportunity]:
+        """
+        Check a single event for maker-mode sell-side opportunity.
+
+        Prices at mid-price (between bid and ask) instead of crossing the spread.
+        Maker orders pay 0% fee on Polymarket.
+        """
+        # Get sell-tradeable outcomes (requires bid price and bid liquidity)
+        tradeable = [o for o in event.outcomes if o.is_tradeable_sell_side(self.config)]
+
+        if len(tradeable) < self.config.min_outcomes:
+            return None
+
+        if len(tradeable) > self.config.max_legs:
+            return None
+
+        # Check for stale data
+        if event.has_stale_data(self.config.staleness_ttl_ms):
+            # Already counted in buy-side, don't double-count
+            return None
+
+        # Calculate maker prices at mid-price with optional offset
+        maker_prices = []
+        for o in tradeable:
+            if o.bba.best_bid is None or o.bba.best_ask is None:
+                return None
+
+            mid = (o.bba.best_bid + o.bba.best_ask) / 2
+            # Apply offset (negative offset = more aggressive = closer to bid)
+            offset = self.config.maker_price_offset_bps / 10000.0
+            maker_price = mid - offset
+            # Cap at best_bid (don't sell for less than crossing)
+            maker_price = max(maker_price, o.bba.best_bid)
+            # Round to 2 decimal places (Polymarket uses cents)
+            maker_prices.append(round(maker_price, 2))
+
+        sum_of_prices = sum(maker_prices)
+        num_legs = len(tradeable)
+        # Gross edge: how much bids exceed $1.00
+        gross_edge = sum_of_prices - 1.0
+
+        # Check bid-side liquidity
+        bid_sizes = [o.bba.bid_size for o in tradeable if o.bba.bid_size is not None]
+        if not bid_sizes:
+            self.stats.liquidity_rejections += 1
+            return None
+
+        min_liquidity = min(bid_sizes)
+        if min_liquidity < self.config.min_liquidity_per_outcome:
+            self.stats.liquidity_rejections += 1
+            return None
+
+        # Calculate sizing
+        max_size_liquidity = min_liquidity
+        max_size_risk = self.config.max_position_per_event / sum_of_prices if sum_of_prices > 0 else 0
+        max_size = min(max_size_liquidity, max_size_risk)
+        suggested_size = max_size * 0.8  # 80% of max for safety
+
+        if suggested_size <= 0:
+            return None
+
+        # Gas per share (amortized)
+        total_gas_cost = self.config.gas_per_leg * num_legs
+        gas_per_share = total_gas_cost / suggested_size if suggested_size > 0 else total_gas_cost
+
+        # Maker fee = 0 on Polymarket
+        fee_per_share = 0.0
+
+        # Net edge: proceeds - payout - fees - gas
+        net_edge = gross_edge - fee_per_share - gas_per_share
+
+        # Track candidate for diagnostics
+        self._last_scan_candidates.append({
+            "title": event.title[:60],
+            "direction": "SELL(maker)",
+            "legs": num_legs,
+            "sum_prices": round(sum_of_prices, 4),
+            "gross_edge": round(gross_edge, 4),
+            "fee": round(fee_per_share, 4),
+            "gas_per_share": round(gas_per_share, 6),
+            "net_edge": round(net_edge, 4),
+            "min_liq": round(min_liquidity, 0),
+            "size": round(suggested_size, 0),
+        })
+
+        # Check minimum net edge (use maker threshold)
+        if net_edge < self.config.maker_min_net_edge:
+            self.stats.edge_too_low_rejections += 1
+            if gross_edge > 0:
+                logger.debug(
+                    f"SELL_MAKER_EDGE_REJECT: {event.title[:60]} | legs={num_legs} | "
+                    f"sum_prices={sum_of_prices:.4f} | gross={gross_edge:.4f} ({gross_edge*100:.2f}%) | "
+                    f"fee={fee_per_share:.4f} | gas/sh={gas_per_share:.6f} | "
+                    f"net={net_edge:.4f} ({net_edge*100:.2f}%) | "
+                    f"min_liq={min_liquidity:.0f} | size={suggested_size:.0f}"
+                )
+            return None
+
+        # Check cooldown
+        cooldown_key = f"sell_{event.event_id}"
+        if cooldown_key in self._opportunity_cooldown:
+            if datetime.utcnow() < self._opportunity_cooldown[cooldown_key]:
+                return None
+
+        self._opportunity_cooldown[cooldown_key] = datetime.utcnow() + timedelta(seconds=2)
+
+        # Build sell-side leg specifications with maker prices
+        legs = []
+        for i, outcome in enumerate(tradeable):
+            leg = {
+                "token_id": outcome.token_id,
+                "market_id": outcome.market_id,
+                "outcome_name": outcome.name,
+                "side": "SELL",
+                "price": maker_prices[i],
+                "size": suggested_size,
+                "order_type": "maker",  # Flag for execution engine
+            }
+            legs.append(leg)
+
+        # Create opportunity
+        opportunity = NegriskOpportunity(
+            opportunity_id=f"negrisk_maker_sell_{uuid.uuid4().hex[:12]}",
+            event=event,
+            direction=ArbDirection.SELL_ALL,
+            sum_of_prices=sum_of_prices,
+            gross_edge=gross_edge,
+            net_edge=net_edge,
+            suggested_size=suggested_size,
+            max_size=max_size,
+            legs=legs,
+            detected_at=datetime.utcnow(),
+            expires_at=datetime.utcnow() + timedelta(seconds=5),
+        )
+
+        # Track stats
+        self.stats.opportunities_detected += 1
+        if net_edge > self.stats.best_edge_seen:
+            self.stats.best_edge_seen = net_edge
+            self.stats.best_edge_event = f"[SELL-MAKER] {event.title}"
+
+        # Cache opportunity
+        self._recent_opportunities[opportunity.opportunity_id] = opportunity
+
+        logger.info(
+            f"SELL-ALL(maker) opportunity: {event.title[:40]} | "
+            f"sum_prices={sum_of_prices:.4f} | gross={gross_edge:.4f} | "
             f"fees={fee_per_share:.4f} | gas/share={gas_per_share:.6f} | "
             f"NET edge={net_edge:.4f} | legs={num_legs} | size={suggested_size:.2f}"
         )

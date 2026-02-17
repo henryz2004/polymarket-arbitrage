@@ -157,13 +157,16 @@ class NegriskEngine:
             if not self._is_event_tradeable(event):
                 return
 
-            # Detect buy-side opportunity
-            buy_opp = self.detector._check_event(event)
+            # Detect opportunities based on order strategy
+            if self.config.order_strategy == "maker":
+                buy_opp = self.detector._check_event_maker(event)
+                sell_opp = self.detector._check_event_maker_sell_side(event)
+            else:
+                buy_opp = self.detector._check_event(event)
+                sell_opp = self.detector._check_event_sell_side(event)
+
             if buy_opp:
                 await self._execute_opportunity(buy_opp)
-
-            # Detect sell-side opportunity
-            sell_opp = self.detector._check_event_sell_side(event)
             if sell_opp:
                 await self._execute_opportunity(sell_opp)
 
@@ -208,8 +211,11 @@ class NegriskEngine:
         if not events:
             return
 
-        # Detect opportunities
-        opportunities = self.detector.detect_opportunities(events)
+        # Detect opportunities using configured strategy
+        opportunities = self.detector.detect_opportunities(
+            events,
+            strategy=self.config.order_strategy
+        )
 
         # Execute each opportunity
         for opportunity in opportunities:
@@ -251,7 +257,11 @@ class NegriskEngine:
             # when the orders are actually filled.
             # TODO: Add callback mechanism from execution engine to mark executed on fill.
 
-            logger.info(f"Neg-risk opportunity submitted: {opportunity.opportunity_id}")
+            # Log maker orders differently (passive, not immediate fill)
+            if any(leg.get("order_type") == "maker" for leg in opportunity.legs):
+                logger.info(f"MAKER opportunity submitted (passive): {opportunity.opportunity_id}")
+            else:
+                logger.info(f"Neg-risk opportunity submitted: {opportunity.opportunity_id}")
 
         except Exception as e:
             logger.error(f"Failed to execute opportunity {opportunity.opportunity_id}: {e}")
