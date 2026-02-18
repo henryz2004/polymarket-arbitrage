@@ -37,30 +37,50 @@ class NegriskEngine:
 
     Orchestrates event discovery, price tracking, opportunity detection,
     and trade execution for neg-risk arbitrage.
+
+    Supports platform abstraction: pass custom registry, tracker_factory,
+    and fee_model for non-Polymarket platforms. When None, falls back to
+    creating Polymarket instances (existing behavior).
     """
 
     def __init__(
         self,
         config: NegriskConfig,
-        execution_engine: ExecutionEngine,
-        risk_manager: RiskManager,
+        execution_engine: Optional[ExecutionEngine] = None,
+        risk_manager: Optional[RiskManager] = None,
+        registry=None,
+        tracker_factory=None,
+        fee_model=None,
+        scan_only: bool = False,
+        platform: str = "polymarket",
+        limitless_executor=None,
     ):
         """
         Initialize the neg-risk engine.
 
         Args:
             config: Neg-risk configuration
-            execution_engine: Execution engine for order placement
-            risk_manager: Risk manager for position limits
+            execution_engine: Execution engine for order placement (None in scan_only mode)
+            risk_manager: Risk manager for position limits (None in scan_only mode)
+            registry: Custom RegistryProtocol implementation (default: NegriskRegistry)
+            tracker_factory: Callable(registry, config, on_price_update) -> BBATrackerProtocol
+            fee_model: Custom FeeModelProtocol implementation (default: PolymarketFeeModel)
+            scan_only: If True, detect only — no Signal creation or execution
+            platform: Platform identifier for logging
+            limitless_executor: LimitlessExecutor for Limitless order placement (None = no execution)
         """
         self.config = config
         self.execution_engine = execution_engine
         self.risk_manager = risk_manager
+        self.scan_only = scan_only
+        self.platform = platform
+        self.limitless_executor = limitless_executor
 
-        # Core components
-        self.registry = NegriskRegistry(config)
+        # Core components — use injected or default Polymarket implementations
+        self.registry = registry if registry is not None else NegriskRegistry(config)
+        self._tracker_factory = tracker_factory
         self.tracker: Optional[BBATracker] = None
-        self.detector = NegriskDetector(config)
+        self.detector = NegriskDetector(config, fee_model=fee_model)
         self.partial_detector = PartialPositionDetector(config)
         self.binary_detector = BinaryBundleDetector(config)
 
@@ -78,7 +98,7 @@ class NegriskEngine:
         # Per-event execution cooldown to prevent double-execution
         self._execution_cooldown: dict[str, datetime] = {}
 
-        logger.info("NegriskEngine initialized")
+        logger.info(f"NegriskEngine initialized (platform={platform}, scan_only={scan_only})")
 
     async def start(self) -> None:
         """Start the neg-risk arbitrage engine."""
@@ -94,11 +114,16 @@ class NegriskEngine:
         await asyncio.sleep(2)
 
         # Start BBA tracker with price update callback
-        self.tracker = BBATracker(
-            registry=self.registry,
-            config=self.config,
-            on_price_update=self._on_price_update,
-        )
+        if self._tracker_factory:
+            self.tracker = self._tracker_factory(
+                self.registry, self.config, self._on_price_update,
+            )
+        else:
+            self.tracker = BBATracker(
+                registry=self.registry,
+                config=self.config,
+                on_price_update=self._on_price_update,
+            )
         await self.tracker.start()
 
         # Seed initial CLOB data for all tracked tokens
@@ -389,10 +414,35 @@ class NegriskEngine:
         3. Creating a bundle signal with all legs
         4. Submitting to execution engine
 
+        In scan_only mode, logs the opportunity and returns without execution.
+
         Note: We don't mark as "executed" here because submit_signal only queues.
         The opportunity should be marked executed when orders actually fill.
         """
         try:
+            # Scan-only mode: log and return
+            if self.scan_only:
+                logger.info(
+                    f"[{self.platform}] SCAN-ONLY: {opportunity.direction.value} "
+                    f"on {opportunity.event.title[:40]} | "
+                    f"net_edge={opportunity.net_edge:.4f} | "
+                    f"legs={opportunity.num_legs} | size={opportunity.suggested_size:.2f}"
+                )
+                self.detector.stats.opportunities_submitted += 1
+                return
+
+            # Limitless platform: route to LimitlessExecutor
+            if self.platform == "limitless" and self.limitless_executor:
+                result = await self.limitless_executor.execute_opportunity(opportunity)
+                if result.success:
+                    self.detector.stats.opportunities_submitted += 1
+                    self.detector.mark_executed(opportunity.opportunity_id)
+                    logger.info(f"[limitless] Executed: {opportunity.opportunity_id} ({result.reason})")
+                else:
+                    self.detector.stats.execution_failures += 1
+                    logger.warning(f"[limitless] Execution failed: {result.reason}")
+                return
+
             # Per-event execution cooldown to prevent double-execution
             cooldown_key = f"{opportunity.event.event_id}_{opportunity.direction.value}"
             now = datetime.utcnow()
@@ -525,12 +575,14 @@ class NegriskEngine:
         tracker_stats = self.tracker.get_stats() if self.tracker else {}
 
         return {
+            "platform": self.platform,
             "registry": registry_stats,
             "detector": detector_stats,
             "tracker": tracker_stats,
             "engine": {
                 "running": self._running,
                 "scan_interval": self._scan_interval,
+                "scan_only": self.scan_only,
             },
         }
 

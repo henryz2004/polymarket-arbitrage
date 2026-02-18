@@ -243,6 +243,7 @@ class NegriskEvent:
     slug: str                     # URL slug
     title: str                    # Event title/question
     condition_id: str             # CTF condition ID
+    platform: str = "polymarket"  # Platform identifier
 
     # Outcomes
     outcomes: list[Outcome] = field(default_factory=list)
@@ -339,6 +340,7 @@ class NegriskOpportunity:
     """
     opportunity_id: str
     event: NegriskEvent
+    platform: str = "polymarket"  # Platform identifier
 
     # Direction
     direction: ArbDirection = ArbDirection.BUY_ALL
@@ -431,6 +433,7 @@ class NegriskStats:
 
     # Error tracking
     stale_data_rejections: int = 0
+    incomplete_coverage_rejections: int = 0
     liquidity_rejections: int = 0
     edge_too_low_rejections: int = 0
     execution_failures: int = 0

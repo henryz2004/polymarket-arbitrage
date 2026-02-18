@@ -101,13 +101,15 @@ JSON Lines file with stats snapshots every 5 minutes:
   "tracker": {...},
   "detector": {...},
   "opportunities_by_edge": {
-    "1.5-2.0%": 2,
+    "0.0-2.0%": 3,
     "2.0-3.0%": 1,
     "3.0-5.0%": 0,
     "5.0%+": 0
   }
 }
 ```
+
+> **Note:** Edge buckets are dynamic based on the `--edge` flag. With `--edge 1.5` you'll see `"1.5-2.0%"`, with `--edge 0.0` you'll see `"0.0-2.0%"`, etc.
 
 ## Configuration
 
@@ -118,13 +120,26 @@ NegriskConfig(
     min_net_edge=0.015,              # 1.5% (or --edge argument)
     min_outcomes=3,                  # At least 3 outcomes
     max_legs=15,                     # Max 15 outcomes
-    staleness_ttl_ms=60000.0,        # 60 second freshness
-    taker_fee_bps=150,               # 1.5% Polymarket fee
-    gas_per_leg=0.01,                # $0.01 gas per leg (realistic for Polygon)
+    staleness_ttl_ms=5000.0,         # 5 second freshness
+    fee_rate_bps=0,                  # Most neg-risk markets are fee-free
+    gas_per_leg=0.0,                 # Polymarket covers gas
     min_liquidity_per_outcome=50.0,  # $50 minimum
     min_event_volume_24h=5000.0,     # $5k volume minimum
+    ws_only_mode=True,               # WebSocket-only mode (no CLOB verification)
+    use_depth_scanning=True,         # Full book depth pricing
 )
 ```
+
+### Production Safety Features
+
+The test harness (and production engine) include several safety mechanisms:
+
+- **Stale data validation**: Rejects opportunities where BBA data exceeds `staleness_ttl_ms` age
+- **Signal deduplication**: Prevents duplicate signal submission within 60 seconds (in `execution.py`)
+- **Execution cooldown**: 5-second per-event cooldown prevents double-execution
+- **WS connectivity tracking**: Monitors WebSocket health; sequence gaps trigger CLOB refresh
+- **Phantom liquidity rejection**: Filters opportunities backed only by Gamma API prices without real CLOB depth
+- **Post-scan delay**: 500ms delay after scan completion prevents redundant re-scans
 
 ## Analysis Commands
 
@@ -276,6 +291,12 @@ nohup python negrisk_long_test.py --duration 12 --edge 1.5 > /dev/null 2>&1 &
 nohup python negrisk_long_test.py --duration 12 --edge 0.8 > /dev/null 2>&1 &
 ```
 Good for: Understanding edge sensitivity, comparing opportunity frequency across thresholds
+
+### 6. Wide-open scan (24 hours, 0% edge):
+```bash
+nohup python negrisk_long_test.py --duration 24 --edge 0.0 > /dev/null 2>&1 &
+```
+Good for: Seeing ALL opportunities regardless of edge, understanding the full opportunity landscape
 
 ## Tips
 

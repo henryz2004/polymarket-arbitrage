@@ -2849,5 +2849,344 @@ class TestEventDrivenFocus:
 
 
 
+class TestLimitlessExecutor:
+    """Test Limitless Exchange executor."""
+
+    def _make_opportunity(self, num_legs=3, direction=ArbDirection.BUY_ALL,
+                          net_edge=0.05, size=100.0):
+        """Helper to create a test NegriskOpportunity with legs."""
+        outcomes = []
+        legs = []
+        for i in range(num_legs):
+            price = 0.30 + i * 0.01
+            outcomes.append(Outcome(
+                outcome_id=f"o{i}",
+                market_id=f"market-{i}",
+                condition_id="c1",
+                token_id=f"token_{i}",
+                name=f"Outcome {i}",
+                bba=OutcomeBBA(best_ask=price, ask_size=200.0,
+                               best_bid=price - 0.02, bid_size=200.0),
+            ))
+            legs.append({
+                "market_id": f"market-{i}",
+                "token_id": f"token_{i}",
+                "outcome_name": f"Outcome {i}",
+                "price": price,
+                "size": size,
+                "side": "BUY" if direction == ArbDirection.BUY_ALL else "SELL",
+            })
+
+        event = NegriskEvent(
+            event_id="e_test",
+            slug="test-executor",
+            title="Test Executor Event",
+            condition_id="c1",
+            platform="limitless",
+            volume_24h=10000.0,
+            outcomes=outcomes,
+        )
+
+        return NegriskOpportunity(
+            opportunity_id="opp_test_123",
+            event=event,
+            platform="limitless",
+            direction=direction,
+            sum_of_prices=sum(leg["price"] for leg in legs),
+            gross_edge=net_edge + 0.01,
+            net_edge=net_edge,
+            suggested_size=size,
+            max_size=size * 2,
+            legs=legs,
+        )
+
+    def test_dry_run_simulation(self):
+        """Executor in dry_run mode logs but doesn't call SDK."""
+        from core.negrisk.platforms.limitless.executor import LimitlessExecutor, ExecutionResult
+        import asyncio
+
+        # Create a mock API client (not used in dry_run)
+        class MockAPIClient:
+            pass
+
+        executor = LimitlessExecutor(
+            api_client=MockAPIClient(),
+            dry_run=True,
+        )
+        asyncio.get_event_loop().run_until_complete(executor.initialize())
+
+        opp = self._make_opportunity()
+        result = asyncio.get_event_loop().run_until_complete(
+            executor.execute_opportunity(opp)
+        )
+
+        assert result.success is True
+        assert "DRY_RUN" in result.reason
+        assert len(result.orders) == 3
+        assert all(o.success for o in result.orders)
+        assert all("DRY_RUN" in o.order_id for o in result.orders)
+        assert result.total_cost > 0
+
+        stats = executor.get_stats()
+        assert stats["dry_run_simulations"] == 1
+        assert stats["opportunities_received"] == 1
+        assert stats["executions_attempted"] == 0  # Not attempted in dry-run
+
+    def test_slippage_rejection(self):
+        """Mock orderbook moved — executor rejects due to slippage."""
+        from core.negrisk.platforms.limitless.executor import LimitlessExecutor
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        class MockAPIClient:
+            async def get_orderbook(self, slug):
+                # Return an ask price much higher than detected
+                return {"asks": [{"price": 0.50, "size": 100}], "bids": []}
+
+        executor = LimitlessExecutor(
+            api_client=MockAPIClient(),
+            api_key="test_key",
+            private_key="0x" + "a" * 64,
+            dry_run=False,
+            slippage_tolerance=0.02,
+        )
+        # Manually mark as initialized without SDK (we won't reach order placement)
+        executor._initialized = True
+
+        opp = self._make_opportunity()  # Detected ask price = 0.30
+        result = asyncio.get_event_loop().run_until_complete(
+            executor.execute_opportunity(opp)
+        )
+
+        assert result.success is False
+        assert "Slippage" in result.reason or "slippage" in result.reason.lower()
+
+        stats = executor.get_stats()
+        assert stats["slippage_rejections"] == 1
+
+    def test_multi_leg_success(self):
+        """Mock SDK — all FOK legs fill successfully."""
+        from core.negrisk.platforms.limitless.executor import LimitlessExecutor
+        import asyncio
+        import sys
+        from unittest.mock import MagicMock, AsyncMock
+        from types import ModuleType
+
+        # Mock the SDK modules so import doesn't fail
+        mock_sdk_orders = ModuleType("limitless_sdk.orders")
+        mock_sdk_orders.Side = MagicMock()
+        mock_sdk_orders.Side.BUY = "BUY"
+        mock_sdk_orders.Side.SELL = "SELL"
+        mock_sdk_orders.OrderType = MagicMock()
+        mock_sdk_orders.OrderType.FOK = "FOK"
+        mock_sdk_orders.OrderClient = MagicMock()
+
+        mock_sdk_api = ModuleType("limitless_sdk.api")
+        mock_sdk_api.HttpClient = MagicMock()
+
+        mock_sdk = ModuleType("limitless_sdk")
+
+        mock_eth = ModuleType("eth_account")
+        mock_account = MagicMock()
+        mock_account.from_key.return_value = MagicMock(address="0xtest")
+        mock_eth.Account = mock_account
+
+        # Inject mocks
+        sys.modules["limitless_sdk"] = mock_sdk
+        sys.modules["limitless_sdk.orders"] = mock_sdk_orders
+        sys.modules["limitless_sdk.api"] = mock_sdk_api
+        sys.modules["eth_account"] = mock_eth
+
+        try:
+            # API client returns prices matching detected prices (no slippage)
+            # Detected prices: market-0=0.30, market-1=0.31, market-2=0.32
+            class MockAPIClient:
+                PRICES = {"market-0": 0.30, "market-1": 0.31, "market-2": 0.32}
+                async def get_orderbook(self, slug):
+                    p = self.PRICES.get(slug, 0.30)
+                    return {
+                        "asks": [{"price": p, "size": 500}],
+                        "bids": [{"price": p - 0.02, "size": 500}],
+                    }
+
+            executor = LimitlessExecutor(
+                api_client=MockAPIClient(),
+                api_key="test_key",
+                private_key="0x" + "a" * 64,
+                dry_run=False,
+            )
+            asyncio.get_event_loop().run_until_complete(executor.initialize())
+
+            # Mock the order client to return success
+            executor._order_client.create_order = AsyncMock(return_value={
+                "id": "order_123",
+                "filled_size": 100.0,
+            })
+
+            opp = self._make_opportunity(num_legs=3, size=100.0)
+            result = asyncio.get_event_loop().run_until_complete(
+                executor.execute_opportunity(opp)
+            )
+
+            assert result.success is True
+            assert len(result.orders) == 3
+            assert all(o.success for o in result.orders)
+            assert executor._order_client.create_order.call_count == 3
+
+            stats = executor.get_stats()
+            assert stats["executions_succeeded"] == 1
+            assert stats["total_volume_usd"] > 0
+        finally:
+            # Cleanup mocked modules
+            for mod in ["limitless_sdk", "limitless_sdk.orders",
+                        "limitless_sdk.api", "eth_account"]:
+                sys.modules.pop(mod, None)
+
+    def test_partial_fill_rollback(self):
+        """Leg 3 fails — legs 1-2 should be rolled back."""
+        from core.negrisk.platforms.limitless.executor import LimitlessExecutor
+        import asyncio
+        import sys
+        from unittest.mock import MagicMock, AsyncMock
+        from types import ModuleType
+
+        # Mock SDK modules
+        mock_sdk_orders = ModuleType("limitless_sdk.orders")
+        mock_sdk_orders.Side = MagicMock()
+        mock_sdk_orders.Side.BUY = "BUY"
+        mock_sdk_orders.Side.SELL = "SELL"
+        mock_sdk_orders.OrderType = MagicMock()
+        mock_sdk_orders.OrderType.FOK = "FOK"
+        mock_sdk_orders.OrderClient = MagicMock()
+
+        mock_sdk_api = ModuleType("limitless_sdk.api")
+        mock_sdk_api.HttpClient = MagicMock()
+
+        mock_sdk = ModuleType("limitless_sdk")
+
+        mock_eth = ModuleType("eth_account")
+        mock_account = MagicMock()
+        mock_account.from_key.return_value = MagicMock(address="0xtest")
+        mock_eth.Account = mock_account
+
+        sys.modules["limitless_sdk"] = mock_sdk
+        sys.modules["limitless_sdk.orders"] = mock_sdk_orders
+        sys.modules["limitless_sdk.api"] = mock_sdk_api
+        sys.modules["eth_account"] = mock_eth
+
+        try:
+            # Detected prices: market-0=0.30, market-1=0.31, market-2=0.32
+            class MockAPIClient:
+                PRICES = {"market-0": 0.30, "market-1": 0.31, "market-2": 0.32}
+                async def get_orderbook(self, slug):
+                    p = self.PRICES.get(slug, 0.30)
+                    return {
+                        "asks": [{"price": p, "size": 500}],
+                        "bids": [{"price": p - 0.02, "size": 500}],
+                    }
+
+            executor = LimitlessExecutor(
+                api_client=MockAPIClient(),
+                api_key="test_key",
+                private_key="0x" + "a" * 64,
+                dry_run=False,
+            )
+            asyncio.get_event_loop().run_until_complete(executor.initialize())
+
+            # First 2 calls succeed, 3rd fails
+            call_count = 0
+            async def mock_create_order(**kwargs):
+                nonlocal call_count
+                call_count += 1
+                if call_count <= 2:
+                    return {"id": f"order_{call_count}", "filled_size": 100.0}
+                else:
+                    raise Exception("FOK rejected: insufficient liquidity")
+
+            executor._order_client.create_order = mock_create_order
+
+            opp = self._make_opportunity(num_legs=3, size=100.0)
+            result = asyncio.get_event_loop().run_until_complete(
+                executor.execute_opportunity(opp)
+            )
+
+            assert result.success is False
+            assert "Leg 3 failed" in result.reason
+            assert len(result.orders) == 3
+            # First 2 succeeded, 3rd failed
+            assert result.orders[0].success is True
+            assert result.orders[1].success is True
+            assert result.orders[2].success is False
+
+            stats = executor.get_stats()
+            assert stats["executions_failed"] == 1
+            assert stats["rollbacks_attempted"] == 1
+        finally:
+            for mod in ["limitless_sdk", "limitless_sdk.orders",
+                        "limitless_sdk.api", "eth_account"]:
+                sys.modules.pop(mod, None)
+
+    def test_engine_routing(self):
+        """Engine routes limitless opportunities to executor, polymarket to execution_engine."""
+        from core.negrisk.platforms.limitless.executor import LimitlessExecutor, ExecutionResult
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        config = NegriskConfig(min_net_edge=0.01, min_outcomes=3)
+
+        # Create a mock limitless executor
+        mock_executor = MagicMock(spec=LimitlessExecutor)
+        mock_executor.execute_opportunity = AsyncMock(return_value=ExecutionResult(
+            success=True, reason="test"
+        ))
+
+        from core.negrisk.engine import NegriskEngine
+
+        # Limitless engine with executor
+        engine = NegriskEngine(
+            config=config,
+            scan_only=False,
+            platform="limitless",
+            limitless_executor=mock_executor,
+        )
+
+        opp = self._make_opportunity()
+
+        asyncio.get_event_loop().run_until_complete(
+            engine._execute_opportunity(opp)
+        )
+
+        # Should have routed to limitless executor
+        mock_executor.execute_opportunity.assert_called_once_with(opp)
+
+    def test_engine_scan_only_skips_executor(self):
+        """Engine in scan_only mode logs without calling executor."""
+        from core.negrisk.platforms.limitless.executor import LimitlessExecutor
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        config = NegriskConfig(min_net_edge=0.01, min_outcomes=3)
+
+        mock_executor = MagicMock(spec=LimitlessExecutor)
+        mock_executor.execute_opportunity = AsyncMock()
+
+        from core.negrisk.engine import NegriskEngine
+
+        engine = NegriskEngine(
+            config=config,
+            scan_only=True,  # Scan only — should NOT call executor
+            platform="limitless",
+            limitless_executor=mock_executor,
+        )
+
+        opp = self._make_opportunity()
+        asyncio.get_event_loop().run_until_complete(
+            engine._execute_opportunity(opp)
+        )
+
+        # Executor should NOT be called in scan_only mode
+        mock_executor.execute_opportunity.assert_not_called()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

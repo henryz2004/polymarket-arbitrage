@@ -33,6 +33,7 @@ from core.negrisk.models import NegriskConfig, NegriskOpportunity
 from core.negrisk.registry import NegriskRegistry
 from core.negrisk.bba_tracker import BBATracker
 from core.negrisk.detector import NegriskDetector
+from core.negrisk.fee_models import LimitlessFeeModel, PolymarketFeeModel
 
 
 class DetailedFormatter(logging.Formatter):
@@ -60,11 +61,18 @@ class NegriskLongTest:
 
     def __init__(self, duration_hours: float = 4.0, min_net_edge: float = 0.015,
                  min_liquidity_per_outcome: float = 50.0,
-                 min_event_volume_24h: float = 5000.0):
+                 min_event_volume_24h: float = 5000.0,
+                 platform: str = "polymarket",
+                 execute: bool = False,
+                 dry_run: bool = True):
         self.duration = timedelta(hours=duration_hours)
         self.min_net_edge = min_net_edge
         self.min_liquidity_per_outcome = min_liquidity_per_outcome
         self.min_event_volume_24h = min_event_volume_24h
+        self.platform = platform
+        self.execute = execute
+        self.dry_run_mode = dry_run
+        self._limitless_executor = None
         self.start_time = datetime.now()
         self.end_time = self.start_time + self.duration
 
@@ -157,8 +165,11 @@ class NegriskLongTest:
         self._running = True
 
         self.logger.info("=" * 80)
-        self.logger.info("NEGRISK LONG-RUNNING TEST")
+        self.logger.info(f"NEGRISK LONG-RUNNING TEST [{self.platform.upper()}]")
         self.logger.info("=" * 80)
+        self.logger.info(f"Platform: {self.platform}")
+        self.logger.info(f"Mode: {'EXECUTE' if self.execute else 'SCAN-ONLY'}"
+                        f"{' (DRY_RUN)' if self.execute and self.dry_run_mode else ''}")
         self.logger.info(f"Duration: {self.duration.total_seconds() / 3600:.1f} hours")
         self.logger.info(f"Min Net Edge: {self.min_net_edge * 100:.1f}%")
         self.logger.info(f"Min Liquidity/Outcome: ${self.min_liquidity_per_outcome:.0f}")
@@ -170,10 +181,40 @@ class NegriskLongTest:
         self.logger.info(f"Opportunities File: {self.opportunities_file}")
         self.logger.info("=" * 80)
 
-        # Initialize components
-        self.logger.info("Initializing registry...")
-        self.registry = NegriskRegistry(self.config)
-        self.detector = NegriskDetector(self.config)
+        # Initialize components (platform-specific)
+        self.logger.info(f"Initializing registry for platform: {self.platform}...")
+
+        if self.platform == "limitless":
+            from core.negrisk.platforms.limitless.api_client import LimitlessAPIClient
+            from core.negrisk.platforms.limitless.registry import LimitlessRegistry
+            from core.negrisk.platforms.limitless.bba_tracker import LimitlessBBATracker
+
+            api_client = LimitlessAPIClient()
+            await api_client.start()
+            self.registry = LimitlessRegistry(self.config, api_client=api_client)
+            fee_model = LimitlessFeeModel()
+            self.detector = NegriskDetector(self.config, fee_model=fee_model)
+            self._limitless_api_client = api_client  # Keep reference for cleanup
+
+            # Initialize executor if --execute was passed
+            if self.execute:
+                import os
+                from core.negrisk.platforms.limitless.executor import LimitlessExecutor
+
+                self._limitless_executor = LimitlessExecutor(
+                    api_client=api_client,
+                    api_key=os.environ.get("LIMITLESS_API_KEY"),
+                    private_key=os.environ.get("LIMITLESS_PRIVATE_KEY"),
+                    dry_run=self.dry_run_mode,
+                )
+                await self._limitless_executor.initialize()
+                self.logger.info(
+                    f"Limitless executor initialized "
+                    f"({'DRY_RUN' if self.dry_run_mode else 'LIVE'})"
+                )
+        else:
+            self.registry = NegriskRegistry(self.config)
+            self.detector = NegriskDetector(self.config)
 
         await self.registry.start()
         await asyncio.sleep(3)
@@ -184,11 +225,20 @@ class NegriskLongTest:
 
         # Start BBA tracker
         self.logger.info("Starting BBA tracker...")
-        self.tracker = BBATracker(
-            registry=self.registry,
-            config=self.config,
-            on_price_update=self._on_price_update,
-        )
+        if self.platform == "limitless":
+            from core.negrisk.platforms.limitless.bba_tracker import LimitlessBBATracker
+            self.tracker = LimitlessBBATracker(
+                registry=self.registry,
+                config=self.config,
+                on_price_update=self._on_price_update,
+                api_client=self._limitless_api_client,
+            )
+        else:
+            self.tracker = BBATracker(
+                registry=self.registry,
+                config=self.config,
+                on_price_update=self._on_price_update,
+            )
         await self.tracker.start()
         await asyncio.sleep(3)
 
@@ -226,6 +276,10 @@ class NegriskLongTest:
 
         if self.registry:
             await self.registry.stop()
+
+        # Cleanup platform-specific resources
+        if hasattr(self, '_limitless_api_client') and self._limitless_api_client:
+            await self._limitless_api_client.stop()
 
         self.logger.info("Test stopped")
         self._log_final_summary()
@@ -320,11 +374,26 @@ class NegriskLongTest:
             self.total_opportunities += 1
             self._log_opportunity(buy_opp)
             self._categorize_opportunity(buy_opp)
+            if self._limitless_executor:
+                asyncio.create_task(self._execute_opportunity(buy_opp))
 
         if sell_opp:
             self.total_opportunities += 1
             self._log_opportunity(sell_opp)
             self._categorize_opportunity(sell_opp)
+            if self._limitless_executor:
+                asyncio.create_task(self._execute_opportunity(sell_opp))
+
+    async def _execute_opportunity(self, opp: NegriskOpportunity):
+        """Execute an opportunity via the limitless executor."""
+        try:
+            result = await self._limitless_executor.execute_opportunity(opp)
+            if result.success:
+                self.logger.info(f"EXECUTION SUCCESS: {opp.opportunity_id} ({result.reason})")
+            else:
+                self.logger.warning(f"EXECUTION FAILED: {opp.opportunity_id} ({result.reason})")
+        except Exception as e:
+            self.logger.error(f"Execution error: {e}")
 
     async def _scan_loop(self):
         """Main scanning loop."""
@@ -350,12 +419,14 @@ class NegriskLongTest:
 
                 opportunities = self.detector.detect_opportunities(events)
 
-                # Log opportunities
+                # Log and optionally execute opportunities
                 if opportunities:
                     self.total_opportunities += len(opportunities)
                     for opp in opportunities:
                         self._log_opportunity(opp)
                         self._categorize_opportunity(opp)
+                        if self._limitless_executor:
+                            await self._execute_opportunity(opp)
 
                 # Log scan stats every 100 scans (~3 min at 2s interval)
                 if self.total_scans % 100 == 0:
@@ -518,9 +589,22 @@ class NegriskLongTest:
             self.logger.info("")
             self.logger.info("Rejections:")
             self.logger.info(f"  Stale Data: {det_stats['stale_data_rejections']}")
+            self.logger.info(f"  Incomplete Coverage: {det_stats.get('incomplete_coverage_rejections', 0)}")
             self.logger.info(f"  Low Liquidity: {det_stats['liquidity_rejections']}")
             self.logger.info(f"  Edge Too Low: {det_stats['edge_too_low_rejections']}")
             self.logger.info(f"  Execution Failures: {det_stats['execution_failures']}")
+
+        if self._limitless_executor:
+            exec_stats = self._limitless_executor.get_stats()
+            self.logger.info("")
+            self.logger.info("Executor Stats:")
+            self.logger.info(f"  Opportunities received: {exec_stats['opportunities_received']}")
+            self.logger.info(f"  Dry-run simulations: {exec_stats['dry_run_simulations']}")
+            self.logger.info(f"  Executions attempted: {exec_stats['executions_attempted']}")
+            self.logger.info(f"  Executions succeeded: {exec_stats['executions_succeeded']}")
+            self.logger.info(f"  Executions failed: {exec_stats['executions_failed']}")
+            self.logger.info(f"  Slippage rejections: {exec_stats['slippage_rejections']}")
+            self.logger.info(f"  Total volume: ${exec_stats['total_volume_usd']:.2f}")
 
         self.logger.info("=" * 80)
         self.logger.info(f"Logs saved to: {self.log_file}")
@@ -540,14 +624,61 @@ async def main():
                        help='Minimum ask liquidity per outcome in $ (default: 50)')
     parser.add_argument('--min-volume', type=float, default=5000.0,
                        help='Minimum 24h event volume in $ (default: 5000)')
+    parser.add_argument('--platform', type=str, default='polymarket',
+                       choices=['polymarket', 'limitless', 'all'],
+                       help='Platform to scan (default: polymarket)')
+    parser.add_argument('--execute', action='store_true', default=False,
+                       help='Enable order execution (default: scan-only)')
+    parser.add_argument('--dry-run', action='store_true', default=False,
+                       help='With --execute: simulate orders without placing them')
 
     args = parser.parse_args()
+
+    # Platform-specific defaults
+    if args.platform == "limitless":
+        # Higher min edge due to 3% taker fee, lower liquidity thresholds
+        if args.edge == 1.5:  # User didn't override
+            args.edge = 2.0
+        if args.min_liquidity == 50.0:
+            args.min_liquidity = 20.0
+        if args.min_volume == 5000.0:
+            args.min_volume = 100.0
+
+    if args.platform == "all":
+        # Run both platforms concurrently
+        tests = []
+        for plat, edge_default, liq_default, vol_default in [
+            ("polymarket", args.edge, args.min_liquidity, args.min_volume),
+            ("limitless", max(args.edge, 2.0), min(args.min_liquidity, 20.0), min(args.min_volume, 100.0)),
+        ]:
+            tests.append(NegriskLongTest(
+                duration_hours=args.duration,
+                min_net_edge=edge_default / 100.0,
+                min_liquidity_per_outcome=liq_default,
+                min_event_volume_24h=vol_default,
+                platform=plat,
+            ))
+
+        try:
+            await asyncio.gather(*(t.start() for t in tests))
+            while any(t._running for t in tests):
+                await asyncio.sleep(1)
+        except KeyboardInterrupt:
+            print("\n\nTest interrupted by user")
+            await asyncio.gather(*(t.stop() for t in tests))
+        except Exception as e:
+            logging.getLogger("negrisk_test").error(f"Fatal error: {e}", exc_info=True)
+            await asyncio.gather(*(t.stop() for t in tests))
+        return
 
     test = NegriskLongTest(
         duration_hours=args.duration,
         min_net_edge=args.edge / 100.0,  # Convert percentage to decimal
         min_liquidity_per_outcome=args.min_liquidity,
         min_event_volume_24h=args.min_volume,
+        platform=args.platform,
+        execute=args.execute,
+        dry_run=args.dry_run,
     )
 
     try:

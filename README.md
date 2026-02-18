@@ -47,7 +47,8 @@
 
 - **🔀 Cross-Platform Arbitrage** - Detects price differences between Polymarket and Kalshi for the same prediction
 - **🔍 Bundle Arbitrage Detection** - Identifies when YES + NO prices don't sum to ~$1.00
-- **🎯 Neg-Risk Arbitrage** - Multi-outcome winner-take-all markets where sum of all outcome asks < $1.00
+- **🎯 Neg-Risk Arbitrage** - Multi-outcome winner-take-all markets: BUY_ALL (asks < $1) and SELL_ALL (bids > $1)
+- **🔗 Binary Bundle Arb** - YES+NO bundle mispricing on 2-outcome neg-risk events
 - **📊 Market Making** - Captures spreads by placing competitive bid/ask orders
 - **🛡️ Risk Management** - Position limits, loss limits, kill switch
 - **📈 Live Dashboard** - Real-time web UI showing opportunities and bot activity
@@ -56,6 +57,9 @@
 - **📝 Comprehensive Logging** - Detailed logs for trades, opportunities, and errors
 - **🤖 Market Matching AI** - Automatically matches similar predictions across platforms using text similarity
 - **⚛️ Atomic Execution** - Bundle and neg-risk orders execute all-or-nothing with rollback
+- **🛡️ Production Safety** - Stale data validation, signal deduplication, execution cooldowns, WS connectivity tracking
+- **📈 Depth-Adjusted Pricing** - Walks full order book depth for accurate fill prices
+- **🔍 Phantom Liquidity Detection** - Filters out opportunities backed only by Gamma API prices without real CLOB depth
 
 ---
 
@@ -110,15 +114,17 @@ polymarket-arbitrage/
 │   ├── data_feed.py         # Real-time market data manager
 │   ├── arb_engine.py        # Single-platform opportunity detection
 │   ├── cross_platform_arb.py # Cross-platform arbitrage
-│   ├── execution.py         # Order management (single + atomic bundles)
+│   ├── execution.py         # Order management with signal dedup + cooldowns
 │   ├── risk_manager.py      # Risk limits & kill switch
 │   ├── portfolio.py         # Position & PnL tracking
 │   └── negrisk/             # Neg-risk multi-outcome arbitrage
-│       ├── models.py        # Data models (events, outcomes, opportunities)
-│       ├── registry.py      # Event discovery from Gamma API
-│       ├── bba_tracker.py   # Real-time BBA via WebSocket + CLOB
-│       ├── detector.py      # Opportunity detection (sum of asks < $1)
-│       └── engine.py        # Orchestrator
+│       ├── models.py        # Data models, config, BBA with source tracking + depth
+│       ├── registry.py      # Event discovery + priority scoring (resolution, volume)
+│       ├── bba_tracker.py   # Real-time BBA via WebSocket + CLOB seeding + WS health
+│       ├── detector.py      # BUY_ALL + SELL_ALL detection (taker/maker, depth-adjusted)
+│       ├── binary_detector.py # Binary YES+NO bundle detection
+│       ├── partial_detector.py # +EV partial subset detection (Kelly sizing)
+│       └── engine.py        # Orchestrator (ws_only_mode, priority sorting, cooldowns)
 │
 ├── dashboard/                # Web dashboard
 │   ├── server.py            # FastAPI server
@@ -248,17 +254,29 @@ The bot uses **text similarity matching** to automatically find equivalent predi
 
 Exploits mispricing in **multi-outcome winner-take-all markets** (e.g., "Who will win the 2024 election?"). Polymarket's neg-risk adapter allows capital-efficient trading of these events.
 
-| Condition | Action | Profit |
-|-----------|--------|--------|
-| Sum of all outcome asks < $1.00 (after fees) | Buy YES on every outcome | Guaranteed $1 payout when one wins |
+| Direction | Condition | Action | Profit |
+|-----------|-----------|--------|--------|
+| **BUY_ALL** | Sum of asks < $1.00 (after fees) | Buy YES on every outcome | $1.00 payout - cost |
+| **SELL_ALL** | Sum of bids > $1.00 (after fees) | Sell YES on every outcome | Proceeds - $1.00 liability |
 
-**Example**: An event with 5 outcomes priced at $0.28, $0.25, $0.20, $0.10, $0.08 = $0.91 total. Buy all 5 for $0.91, one will resolve to $1.00 = **9% gross edge** (minus 1.5% fees).
+**Example (BUY_ALL)**: 5 outcomes priced at $0.28, $0.25, $0.20, $0.10, $0.08 = $0.91 total. Buy all for $0.91, one resolves to $1.00 = **9% gross edge**.
+
+**Example (SELL_ALL)**: 5 outcomes with bids $0.30, $0.28, $0.22, $0.12, $0.12 = $1.04 total. Sell all for $1.04, pay out $1.00 = **4% gross edge**.
 
 **How it works:**
-1. **Registry** discovers neg-risk events from Gamma API (~300 events, ~6000 tokens)
-2. **BBA Tracker** streams real-time prices via WebSocket, seeds initial data from CLOB
-3. **Detector** continuously scans for sum-of-asks < $1.00 - fees
-4. **Engine** executes atomically -- all legs must succeed or all are rolled back
+1. **Registry** discovers neg-risk events from Gamma API (~300 events, ~6000 tokens), scores priority by resolution proximity and volume spikes
+2. **BBA Tracker** streams real-time prices via WebSocket, seeds initial data from CLOB, re-seeds gamma-only tokens every 5 min, tracks WS connectivity and sequence gaps
+3. **Detector** scans both buy and sell sides with:
+   - **Depth-adjusted pricing** — walks full order book, not just top-of-book
+   - **Phantom liquidity rejection** — filters opportunities backed only by Gamma API prices without real CLOB depth
+   - **Taker or maker mode** — cross spread (1.5% fee) or place at mid-price (0% fee)
+   - **Priority-scaled edge** — near-resolution events get lower minimum edge thresholds
+4. **Engine** orchestrates with production safety: stale data validation, signal deduplication (60s), per-event execution cooldowns (5s), WS connectivity checks
+5. **ws_only_mode** — optional low-latency mode that skips CLOB verification, trusting WebSocket data with additional validation
+
+**Additional detectors:**
+- **BinaryBundleDetector** — YES+NO mispricing on 2-outcome events (BUY_BINARY / SELL_BINARY)
+- **PartialPositionDetector** — +EV subset detection using Kelly criterion (disabled by default, NOT riskless)
 
 **Key difference from bundle arb**: Bundle arb trades YES+NO on a single binary market. Neg-risk trades YES across *all outcomes* of a multi-outcome event.
 
@@ -305,17 +323,54 @@ Places orders inside wide spreads:
 
 Neg-risk parameters are defined in `NegriskConfig` (see `core/negrisk/models.py`):
 
+**Core Detection:**
+
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `min_net_edge` | Min net edge after fees & gas | 0.025 (2.5%) |
+| `min_net_edge` | Min net edge after fees & gas | 0.015 (1.5%) |
 | `min_outcomes` | Min outcomes for event | 3 |
 | `max_legs` | Max outcomes to trade | 15 |
-| `staleness_ttl_ms` | Max BBA data age (ms) | 60000 (60s) |
-| `taker_fee_bps` | Polymarket taker fee | 150 (1.5%) |
-| `gas_per_leg` | Gas cost per leg ($) | 0.05 |
+| `staleness_ttl_ms` | Max BBA data age (ms) | 5000 (5s) |
+| `fee_rate_bps` | Per-leg fee rate from CLOB API | 0 (most neg-risk are fee-free) |
+| `gas_per_leg` | Gas cost per leg ($) | 0.00 (Polymarket covers gas) |
 | `min_liquidity_per_outcome` | Min ask liquidity per outcome ($) | 50 |
 | `min_event_volume_24h` | Min 24h event volume ($) | 5000 |
 | `max_position_per_event` | Max exposure per event ($) | 500 |
+
+**WebSocket & Data:**
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `ws_only_mode` | Skip CLOB fetches, trust WebSocket data | false |
+| `ws_sequence_gap_threshold` | Max sequence gaps before CLOB refresh | 5 |
+| `reseed_interval_seconds` | Re-seed gamma-only tokens interval | 300 (5 min) |
+| `use_depth_scanning` | Walk full order book depth | true |
+| `max_book_levels` | Depth levels to store per outcome | 10 |
+
+**Order Strategy:**
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `order_strategy` | "taker" (cross spread) or "maker" (at mid, 0% fee) | "taker" |
+| `maker_price_offset_bps` | Offset from mid-price in bps | 0 |
+| `maker_timeout_seconds` | Cancel unfilled maker orders after | 30 |
+| `maker_min_net_edge` | Lower edge threshold for maker mode | 0.015 (1.5%) |
+
+**Event Prioritization:**
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `prioritize_near_resolution` | Boost near-resolution events | true |
+| `resolution_window_hours` | Priority window | 24 |
+| `priority_edge_discount` | Min edge multiplier for high-priority | 0.5 |
+| `volume_spike_threshold` | Volume spike multiplier | 2.0 |
+
+**Optional Detectors:**
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `binary_bundle_enabled` | YES+NO bundle arb on binary events | false |
+| `enable_partial_positions` | +EV partial subset (NOT riskless) | false |
 
 ### Fee Configuration
 

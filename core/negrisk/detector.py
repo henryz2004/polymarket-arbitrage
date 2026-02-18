@@ -14,6 +14,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Optional
 
+from core.negrisk.fee_models import PolymarketFeeModel
 from core.negrisk.models import (
     ArbDirection,
     NegriskConfig,
@@ -107,8 +108,9 @@ class NegriskDetector:
     Sell-side: sum(bids) - fees - gas > $1.00 → sell all, profit guaranteed.
     """
 
-    def __init__(self, config: NegriskConfig):
+    def __init__(self, config: NegriskConfig, fee_model=None):
         self.config = config
+        self.fee_model = fee_model or PolymarketFeeModel(config.fee_rate_bps, config.gas_per_leg)
         self.stats = NegriskStats()
 
         # Track recent opportunities to avoid duplicates
@@ -234,6 +236,18 @@ class NegriskDetector:
             logger.debug(f"Event {event.title} has too many legs: {len(tradeable)}")
             return None
 
+        # Coverage check: BUY_ALL requires ALL active outcomes to be tradeable.
+        # If some outcomes have no asks, the arb is impossible — you can't buy all legs.
+        active = event.active_outcomes
+        if len(tradeable) < len(active):
+            self.stats.incomplete_coverage_rejections += 1
+            missing = len(active) - len(tradeable)
+            logger.debug(
+                f"COVERAGE_REJECT: {event.title[:60]} | "
+                f"tradeable={len(tradeable)}/{len(active)} (missing {missing} legs)"
+            )
+            return None
+
         # Check for stale data (only for CLOB-backed outcomes)
         clob_outcomes = [o for o in tradeable if o not in gamma_legs]
         if any(o.bba.is_stale(self.config.staleness_ttl_ms) for o in clob_outcomes):
@@ -339,13 +353,11 @@ class NegriskDetector:
         # CRITICAL FIX: Calculate gas per share (amortized over trade size)
         # Gas is a FIXED COST in dollars, not per-share
         # We need to amortize it over the number of shares to get per-share cost
-        total_gas_cost = self.config.gas_per_leg * num_legs  # Total $ gas cost
+        total_gas_cost = self.fee_model.gas_per_leg * num_legs  # Total $ gas cost
         gas_per_share = total_gas_cost / suggested_size if suggested_size > 0 else total_gas_cost
 
-        # Fee per share using Polymarket's on-chain formula:
-        # BUY: fee = (fee_rate_bps / 10000) * min(p, 1-p) / p per leg
-        # Most neg-risk markets are fee-free (fee_rate_bps=0).
-        fee_per_share = _compute_fee_per_share(self.config.fee_rate_bps, asks, "BUY")
+        # Fee per share using platform-specific fee model
+        fee_per_share = self.fee_model.compute_fee_per_share(asks, "BUY")
 
         # Net edge (all per-share metrics now)
         net_edge = gross_edge - fee_per_share - gas_per_share
@@ -469,6 +481,12 @@ class NegriskDetector:
             logger.debug(f"Event {event.title} has too many legs: {len(tradeable)}")
             return None
 
+        # Coverage check: maker buy-all requires ALL active outcomes
+        active = event.active_outcomes
+        if len(tradeable) < len(active):
+            self.stats.incomplete_coverage_rejections += 1
+            return None
+
         # Check for stale data
         if event.has_stale_data(self.config.staleness_ttl_ms):
             self.stats.stale_data_rejections += 1
@@ -514,10 +532,10 @@ class NegriskDetector:
             return None
 
         # Gas per share (amortized over trade size)
-        total_gas_cost = self.config.gas_per_leg * num_legs
+        total_gas_cost = self.fee_model.gas_per_leg * num_legs
         gas_per_share = total_gas_cost / suggested_size if suggested_size > 0 else total_gas_cost
 
-        # Maker fee = 0 on Polymarket
+        # Maker fee = 0 on Polymarket (kept as 0 for backward compat)
         fee_per_share = 0.0
 
         # Net edge (all per-share metrics)
@@ -641,6 +659,12 @@ class NegriskDetector:
         if len(tradeable) > self.config.max_legs:
             return None
 
+        # Coverage check: SELL_ALL requires ALL active outcomes to be tradeable.
+        active = event.active_outcomes
+        if len(tradeable) < len(active):
+            self.stats.incomplete_coverage_rejections += 1
+            return None
+
         # Check for stale data (only for CLOB-backed outcomes)
         clob_outcomes = [o for o in tradeable if o not in gamma_legs]
         if any(o.bba.is_stale(self.config.staleness_ttl_ms) for o in clob_outcomes):
@@ -736,13 +760,11 @@ class NegriskDetector:
                     depth_adjusted = True
 
         # Gas per share (amortized)
-        total_gas_cost = self.config.gas_per_leg * num_legs
+        total_gas_cost = self.fee_model.gas_per_leg * num_legs
         gas_per_share = total_gas_cost / suggested_size if suggested_size > 0 else total_gas_cost
 
-        # Fee per share using Polymarket's on-chain formula:
-        # SELL: fee = (fee_rate_bps / 10000) * min(p, 1-p) per leg
-        # Most neg-risk markets are fee-free (fee_rate_bps=0).
-        fee_per_share = _compute_fee_per_share(self.config.fee_rate_bps, bids, "SELL")
+        # Fee per share using platform-specific fee model
+        fee_per_share = self.fee_model.compute_fee_per_share(bids, "SELL")
 
         # Net edge: proceeds - payout - fees - gas
         net_edge = gross_edge - fee_per_share - gas_per_share
@@ -864,6 +886,12 @@ class NegriskDetector:
         if len(tradeable) > self.config.max_legs:
             return None
 
+        # Coverage check: maker sell-all requires ALL active outcomes
+        active = event.active_outcomes
+        if len(tradeable) < len(active):
+            self.stats.incomplete_coverage_rejections += 1
+            return None
+
         # Check for stale data
         if event.has_stale_data(self.config.staleness_ttl_ms):
             # Already counted in buy-side, don't double-count
@@ -910,10 +938,10 @@ class NegriskDetector:
             return None
 
         # Gas per share (amortized)
-        total_gas_cost = self.config.gas_per_leg * num_legs
+        total_gas_cost = self.fee_model.gas_per_leg * num_legs
         gas_per_share = total_gas_cost / suggested_size if suggested_size > 0 else total_gas_cost
 
-        # Maker fee = 0 on Polymarket
+        # Maker fee = 0 on Polymarket (kept as 0 for backward compat)
         fee_per_share = 0.0
 
         # Net edge: proceeds - payout - fees - gas
@@ -1037,12 +1065,12 @@ class NegriskDetector:
         num_legs = len(tradeable)
 
         # Amortize gas over trade size
-        total_gas_cost = self.config.gas_per_leg * num_legs
+        total_gas_cost = self.fee_model.gas_per_leg * num_legs
         gas_per_share = total_gas_cost / opportunity.suggested_size if opportunity.suggested_size > 0 else total_gas_cost
 
-        # Fee per share using Polymarket's on-chain formula
+        # Fee per share using platform-specific fee model
         side = "SELL" if is_sell else "BUY"
-        fee_per_share = _compute_fee_per_share(self.config.fee_rate_bps, prices, side)
+        fee_per_share = self.fee_model.compute_fee_per_share(prices, side)
 
         # Net edge
         if is_sell:
@@ -1104,6 +1132,7 @@ class NegriskDetector:
             "total_profit": round(self.stats.total_profit, 2),
             "total_volume": round(self.stats.total_volume, 2),
             "stale_data_rejections": self.stats.stale_data_rejections,
+            "incomplete_coverage_rejections": self.stats.incomplete_coverage_rejections,
             "liquidity_rejections": self.stats.liquidity_rejections,
             "edge_too_low_rejections": self.stats.edge_too_low_rejections,
             "execution_failures": self.stats.execution_failures,
