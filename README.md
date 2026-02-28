@@ -143,6 +143,7 @@ polymarket-arbitrage/
 │
 ├── negrisk_long_test.py      # Long-term neg-risk testing script
 ├── NEGRISK_TESTING.md        # Neg-risk testing guide
+├── polymarket_iran_market_analysis.md  # Iran strike market insider trading analysis
 │
 └── logs/                     # Log files (auto-created)
     └── negrisk/              # Neg-risk test logs
@@ -457,6 +458,20 @@ Logs go to `logs/negrisk/` -- see `NEGRISK_TESTING.md` for full details on analy
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Market Analysis: Iran Strike Insider Trading
+
+We performed an investigation into suspicious trading activity on the **"US strikes Iran by February 28, 2026?"** market ($89.6M volume, part of a $528M event). Using minute-level CLOB price data and wallet activity from the Polymarket Data API, we documented:
+
+- A **7 cents to 25.5 cents** price spike starting at **2:15 AM PST on Feb 27** -- 21 hours before news broke
+- **ricosuave666** (`0x0afc...3b2`): 100% win rate on Iran strike markets, $155K+ profit, correctly called the exact date of Israel's June 2025 strikes
+- **4 fresh wallets** with zero prior history that simultaneously bet YES on Iran strikes at <18% odds
+- **thesecondhighlander**: dormant 460 days, placed $100K at 2 cents/share on a single-day strike outcome
+- **Two Israeli indictments** (civilian + military reservist) for using classified intelligence to bet on Polymarket -- the first prosecution of its kind
+
+Full analysis with wallet addresses, minute-level charts, and sources: **[polymarket_iran_market_analysis.md](polymarket_iran_market_analysis.md)**
 
 ---
 
