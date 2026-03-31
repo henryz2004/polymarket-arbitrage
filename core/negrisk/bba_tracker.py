@@ -87,7 +87,18 @@ class BBATracker:
             return
 
         self._running = True
-        self._http_client = httpx.AsyncClient(timeout=10.0)
+        # Use connection pooling with explicit limits for CLOB API performance.
+        # max_connections=100 allows parallel fetches during seeding/reseeding.
+        # max_keepalive_connections=20 keeps warm connections for low-latency
+        # slippage checks and gap recovery fetches.
+        self._http_client = httpx.AsyncClient(
+            timeout=10.0,
+            limits=httpx.Limits(
+                max_connections=100,
+                max_keepalive_connections=20,
+                keepalive_expiry=30.0,
+            ),
+        )
 
         # Start WebSocket task
         self._ws_task = asyncio.create_task(

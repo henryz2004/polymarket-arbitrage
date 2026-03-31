@@ -249,8 +249,10 @@ class NegriskDetector:
             return None
 
         # Check for stale data (only for CLOB-backed outcomes)
+        # Uses category-adaptive TTL: crypto=3s, weather/entertainment=15s, default=5s
+        effective_ttl = event.get_effective_staleness_ttl(self.config)
         clob_outcomes = [o for o in tradeable if o not in gamma_legs]
-        if any(o.bba.is_stale(self.config.staleness_ttl_ms) for o in clob_outcomes):
+        if any(o.bba.is_stale(effective_ttl) for o in clob_outcomes):
             self.stats.stale_data_rejections += 1
             return None
 
@@ -668,8 +670,10 @@ class NegriskDetector:
             return None
 
         # Check for stale data (only for CLOB-backed outcomes)
+        # Uses category-adaptive TTL: crypto=3s, weather/entertainment=15s, default=5s
+        effective_ttl = event.get_effective_staleness_ttl(self.config)
         clob_outcomes = [o for o in tradeable if o not in gamma_legs]
-        if any(o.bba.is_stale(self.config.staleness_ttl_ms) for o in clob_outcomes):
+        if any(o.bba.is_stale(effective_ttl) for o in clob_outcomes):
             # Already counted in buy-side, don't double-count
             return None
 
