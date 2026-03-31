@@ -46,7 +46,9 @@ class NegriskConfig:
     max_legs: int = 15                    # Maximum outcomes to trade
 
     # Staleness parameters
-    staleness_ttl_ms: float = 5000.0      # 5 seconds max staleness
+    staleness_ttl_ms: float = 5000.0      # 5 seconds max staleness (default)
+    staleness_ttl_relaxed_ms: float = 15000.0  # 15s for low-volatility events
+    staleness_ttl_strict_ms: float = 3000.0    # 3s for high-volatility events (crypto)
     ws_sequence_gap_threshold: int = 5    # Max allowed sequence gaps
 
     # Fee parameters (Polymarket)
@@ -244,6 +246,7 @@ class NegriskEvent:
     title: str                    # Event title/question
     condition_id: str             # CTF condition ID
     platform: str = "polymarket"  # Platform identifier
+    category: str = ""            # Event category (e.g. "crypto", "sports", "politics")
 
     # Outcomes
     outcomes: list[Outcome] = field(default_factory=list)
@@ -256,6 +259,7 @@ class NegriskEvent:
     volume_24h: float = 0.0
     liquidity: float = 0.0
     end_date: Optional[datetime] = None
+    fee_rate_bps: Optional[float] = None  # Per-event fee rate override
 
     # Priority scoring
     priority_score: float = 0.0              # Higher = more priority (0.0-1.5 range)
@@ -323,9 +327,29 @@ class NegriskEvent:
         """Get all token IDs for WebSocket subscription."""
         return [o.token_id for o in self.outcomes if o.token_id]
 
+    def get_effective_staleness_ttl(self, config: 'NegriskConfig') -> float:
+        """
+        Get effective staleness TTL based on event category.
+
+        Crypto/fast-moving events use strict TTL (3s).
+        Low-volatility events (weather, entertainment) use relaxed TTL (15s).
+        Everything else uses the default (5s).
+        """
+        cat = self.category.lower()
+        if cat in ("crypto", "finance"):
+            return config.staleness_ttl_strict_ms
+        elif cat in ("weather", "entertainment", "culture", "science"):
+            return config.staleness_ttl_relaxed_ms
+        return config.staleness_ttl_ms
+
     def has_stale_data(self, ttl_ms: float) -> bool:
         """Check if any outcome has stale BBA data."""
         return any(o.bba.is_stale(ttl_ms) for o in self.active_outcomes)
+
+    def has_stale_data_adaptive(self, config: 'NegriskConfig') -> bool:
+        """Check staleness using category-adaptive TTL."""
+        ttl = self.get_effective_staleness_ttl(config)
+        return any(o.bba.is_stale(ttl) for o in self.active_outcomes)
 
 
 @dataclass
@@ -437,6 +461,11 @@ class NegriskStats:
     liquidity_rejections: int = 0
     edge_too_low_rejections: int = 0
     execution_failures: int = 0
+
+    # Pre-filter metrics (performance optimization tracking)
+    prefilter_events_skipped: int = 0     # Events skipped by sum proximity pre-filter
+    prefilter_events_passed: int = 0      # Events that passed pre-filter to detector
+    prefilter_callbacks_skipped: int = 0  # WS callbacks skipped by pre-filter
 
     # Best opportunity seen
     best_edge_seen: float = 0.0

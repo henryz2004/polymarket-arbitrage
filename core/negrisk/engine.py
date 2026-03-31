@@ -182,9 +182,18 @@ class NegriskEngine:
 
         DEDUPLICATION: Only spawn one scan task per event at a time to
         prevent unbounded task creation on high-frequency price updates.
+
+        PRE-FILTER: Uses incremental sum_of_asks/sum_of_bids from registry
+        to skip full detection on events nowhere near an opportunity.
         """
         # Don't spawn a new task if one is already running for this event
         if event_id in self._active_event_scans:
+            return
+
+        # Fast pre-filter: skip events that are far from any opportunity
+        # threshold=0.05 means we only scan if sum_asks < 1.05 or sum_bids > 0.95
+        if not self.registry.is_near_opportunity(event_id, threshold=0.05):
+            self.detector.stats.prefilter_callbacks_skipped += 1
             return
 
         # Record timestamp for latency tracking
@@ -241,10 +250,12 @@ class NegriskEngine:
         except Exception as e:
             logger.debug(f"Event scan error for {event_id}: {e}")
         finally:
-            # Keep event in active scans for 500ms after completion
-            # to prevent immediate re-scan from the next WS tick
+            # Keep event in active scans for 150ms after completion
+            # to prevent immediate re-scan from the next WS tick.
+            # Short cooldown is safe because the detector has its own 2s
+            # opportunity cooldown and the engine has a 5s execution cooldown.
             async def _clear_after_delay(eid: str = event_id) -> None:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.15)
                 self._active_event_scans.discard(eid)
             asyncio.create_task(_clear_after_delay())
 
@@ -281,11 +292,26 @@ class NegriskEngine:
         )
 
     async def _scan_loop(self) -> None:
-        """Main scanning loop - periodically check for opportunities."""
+        """
+        Main scanning loop with adaptive intervals.
+
+        When near-opportunity events exist, scan faster (down to 0.5s).
+        When no events are close, relax to the base interval.
+        This balances responsiveness with CPU/network usage.
+        """
         while self._running:
             try:
-                await self._scan_for_opportunities()
-                await asyncio.sleep(self._scan_interval)
+                # Pre-filter once, then reuse for both scan and interval decision
+                near_events = self.registry.get_near_opportunity_events(threshold=0.05)
+                await self._scan_for_opportunities(near_events)
+
+                # Adaptive interval based on pre-filter results (no extra iteration)
+                if near_events:
+                    interval = 0.5
+                else:
+                    interval = self._scan_interval
+
+                await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -361,10 +387,22 @@ class NegriskEngine:
                 logger.error(f"Re-seed loop error: {e}")
                 await asyncio.sleep(30)
 
-    async def _scan_for_opportunities(self) -> None:
-        """Scan all events for arbitrage opportunities."""
-        # Get tradeable events
-        events = self.registry.get_tradeable_events()
+    async def _scan_for_opportunities(self, prefiltered_events: Optional[list] = None) -> None:
+        """
+        Scan events for arbitrage opportunities using pre-filtered candidates.
+
+        Args:
+            prefiltered_events: Optional pre-filtered event list from caller.
+                If None, performs its own pre-filtering.
+        """
+        events = prefiltered_events if prefiltered_events is not None else \
+            self.registry.get_near_opportunity_events(threshold=0.05)
+
+        # Track pre-filter effectiveness
+        total_events = len(self.registry.get_event_ids())
+        passed_events = len(events) if events else 0
+        self.detector.stats.prefilter_events_passed += passed_events
+        self.detector.stats.prefilter_events_skipped += total_events - passed_events
 
         if not events:
             return
@@ -471,6 +509,7 @@ class NegriskEngine:
                         )
             else:
                 # Standard mode: fetch fresh prices from CLOB for all outcomes
+                # fetch_all_prices already uses asyncio.gather for parallel fetches
                 if self.tracker:
                     await self.tracker.fetch_all_prices(opportunity.event)
 

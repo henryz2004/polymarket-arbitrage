@@ -37,6 +37,10 @@ class NegriskRegistry:
 
     Maintains a list of neg-risk events with their outcomes,
     refreshing periodically from the Gamma API.
+
+    Performance optimization: Maintains incremental sum_of_asks/sum_of_bids
+    per event, updated on each price tick. This allows the engine to skip
+    full detection on events that are nowhere near an opportunity.
     """
 
     GAMMA_API_URL = "https://gamma-api.polymarket.com"
@@ -50,13 +54,29 @@ class NegriskRegistry:
         self._running = False
         self._last_refresh: Optional[datetime] = None
 
+        # Incremental sum tracking for fast opportunity pre-filtering
+        # Updated on each price tick, avoids full detection on cold events
+        self._event_sum_asks: dict[str, Optional[float]] = {}   # event_id -> sum of best asks
+        self._event_sum_bids: dict[str, Optional[float]] = {}   # event_id -> sum of best bids
+        self._event_coverage: dict[str, int] = {}               # event_id -> count of priced outcomes
+
+        # Pre-classified gamma-only tokens (refreshed at registry refresh)
+        self._gamma_only_tokens: set[str] = set()
+
     async def start(self) -> None:
         """Start the registry with initial fetch and periodic refresh."""
         if self._running:
             return
 
         self._running = True
-        self._http_client = httpx.AsyncClient(timeout=30.0)
+        self._http_client = httpx.AsyncClient(
+            timeout=30.0,
+            limits=httpx.Limits(
+                max_connections=20,
+                max_keepalive_connections=5,
+                keepalive_expiry=60.0,
+            ),
+        )
 
         # Initial fetch
         await self._fetch_negrisk_events()
@@ -152,6 +172,21 @@ class NegriskRegistry:
             self._events = new_events
             self._token_to_outcome = new_token_map
             self._last_refresh = datetime.utcnow()
+
+            # Recompute incremental sums for all events
+            self._event_sum_asks.clear()
+            self._event_sum_bids.clear()
+            self._event_coverage.clear()
+            for event in new_events.values():
+                self._recompute_event_sums(event)
+
+            # Pre-classify gamma-only tokens
+            self._gamma_only_tokens = {
+                o.token_id
+                for event in new_events.values()
+                for o in event.active_outcomes
+                if o.token_id and o.bba.source == "gamma"
+            }
 
             # Calculate priority scores for all events
             self._calculate_priority_scores()
@@ -274,6 +309,7 @@ class NegriskRegistry:
                 slug=event_data.get("slug", ""),
                 title=event_data.get("title", "") or event_data.get("question", ""),
                 condition_id=event_data.get("conditionId", ""),
+                category=str(event_data.get("category", "") or "").lower(),
                 outcomes=outcomes,
                 neg_risk=True,
                 neg_risk_augmented=neg_risk_augmented,
@@ -425,6 +461,10 @@ class NegriskRegistry:
 
         return None
 
+    def get_event_ids(self) -> list[str]:
+        """Get all tracked event IDs."""
+        return list(self._events.keys())
+
     def get_all_token_ids(self) -> list[str]:
         """Get all token IDs for WebSocket subscription."""
         return list(self._token_to_outcome.keys())
@@ -441,12 +481,19 @@ class NegriskRegistry:
         bid_levels: Optional[list] = None,
         ask_levels: Optional[list] = None,
     ) -> None:
-        """Update BBA for an outcome by token ID."""
+        """Update BBA for an outcome by token ID, maintaining incremental sums."""
         result = self.get_event_by_token(token_id)
         if not result:
             return
 
         event, outcome = result
+
+        # Incrementally update sum_of_asks and sum_of_bids
+        # Subtract old contribution, add new contribution
+        old_ask = outcome.bba.best_ask
+        old_bid = outcome.bba.best_bid
+        event_id = event.event_id
+
         outcome.bba.best_bid = best_bid
         outcome.bba.best_ask = best_ask
         outcome.bba.bid_size = bid_size
@@ -459,15 +506,131 @@ class NegriskRegistry:
         if ask_levels is not None:
             outcome.bba.ask_levels = ask_levels
 
+        # Update incremental ask sum
+        current_sum_asks = self._event_sum_asks.get(event_id)
+        if current_sum_asks is not None:
+            if old_ask is not None:
+                current_sum_asks -= old_ask
+            if best_ask is not None:
+                current_sum_asks += best_ask
+            self._event_sum_asks[event_id] = current_sum_asks
+        elif best_ask is not None:
+            # First time — compute full sum
+            self._recompute_event_sums(event)
+
+        # Update incremental bid sum
+        current_sum_bids = self._event_sum_bids.get(event_id)
+        if current_sum_bids is not None:
+            if old_bid is not None:
+                current_sum_bids -= old_bid
+            if best_bid is not None:
+                current_sum_bids += best_bid
+            self._event_sum_bids[event_id] = current_sum_bids
+        elif best_bid is not None:
+            self._recompute_event_sums(event)
+
+        # Track coverage (how many outcomes have prices)
+        if old_ask is None and best_ask is not None:
+            self._event_coverage[event_id] = self._event_coverage.get(event_id, 0) + 1
+        elif old_ask is not None and best_ask is None:
+            self._event_coverage[event_id] = max(0, self._event_coverage.get(event_id, 0) - 1)
+
+        # Remove from gamma-only set if we got real data
+        if source in ("clob", "websocket") and token_id in self._gamma_only_tokens:
+            self._gamma_only_tokens.discard(token_id)
+
+    def _recompute_event_sums(self, event: NegriskEvent) -> None:
+        """Recompute full sum_of_asks and sum_of_bids for an event."""
+        active = event.active_outcomes
+        asks = [o.bba.best_ask for o in active if o.bba.best_ask is not None]
+        bids = [o.bba.best_bid for o in active if o.bba.best_bid is not None]
+        self._event_sum_asks[event.event_id] = sum(asks) if asks else None
+        self._event_sum_bids[event.event_id] = sum(bids) if bids else None
+        self._event_coverage[event.event_id] = len(asks)
+
+    def get_event_proximity(self, event_id: str) -> dict:
+        """
+        Get incremental opportunity proximity data for an event.
+
+        Returns dict with sum_asks, sum_bids, coverage, and
+        approximate gross edges. Used for fast pre-filtering.
+        """
+        return {
+            "sum_asks": self._event_sum_asks.get(event_id),
+            "sum_bids": self._event_sum_bids.get(event_id),
+            "coverage": self._event_coverage.get(event_id, 0),
+        }
+
+    def is_near_opportunity(self, event_id: str, threshold: float = 0.05) -> bool:
+        """
+        Fast check: is this event within `threshold` of an arb opportunity?
+
+        Uses incremental sums (no recomputation). Returns True if:
+        - BUY side: sum_asks < 1.0 + threshold  (e.g. < 1.05)
+        - SELL side: sum_bids > 1.0 - threshold  (e.g. > 0.95)
+        - Coverage is incomplete (might be near opportunity with missing data)
+
+        This is a fast pre-filter — full detection still runs on True.
+        """
+        event = self._events.get(event_id)
+        if not event:
+            return False
+
+        num_active = len(event.active_outcomes)
+        coverage = self._event_coverage.get(event_id, 0)
+
+        # If coverage is incomplete, can't rule out opportunity
+        if coverage < num_active:
+            return True
+
+        sum_asks = self._event_sum_asks.get(event_id)
+        sum_bids = self._event_sum_bids.get(event_id)
+
+        if sum_asks is not None and sum_asks < 1.0 + threshold:
+            return True
+        if sum_bids is not None and sum_bids > 1.0 - threshold:
+            return True
+
+        return False
+
+    def is_gamma_only(self, token_id: str) -> bool:
+        """Check if a token is pre-classified as gamma-only (no CLOB/WS data)."""
+        return token_id in self._gamma_only_tokens
+
+    def get_gamma_only_count(self) -> int:
+        """Get count of tokens with only gamma-sourced data."""
+        return len(self._gamma_only_tokens)
+
+    def get_near_opportunity_events(self, threshold: float = 0.05) -> list[NegriskEvent]:
+        """
+        Get events that are within `threshold` of an arb opportunity.
+
+        Much faster than get_tradeable_events() + full detection because
+        it uses pre-computed incremental sums to filter.
+        """
+        near = []
+        for event_id, event in self._events.items():
+            if self.is_near_opportunity(event_id, threshold):
+                near.append(event)
+        return near
+
     def get_stats(self) -> dict:
         """Get registry statistics."""
         total_outcomes = sum(len(e.outcomes) for e in self._events.values())
         active_outcomes = sum(len(e.active_outcomes) for e in self._events.values())
+
+        # Count events near opportunity threshold
+        near_opp_count = sum(
+            1 for eid in self._events
+            if self.is_near_opportunity(eid, 0.05)
+        )
 
         return {
             "events_tracked": len(self._events),
             "total_outcomes": total_outcomes,
             "active_outcomes": active_outcomes,
             "tokens_tracked": len(self._token_to_outcome),
+            "gamma_only_tokens": len(self._gamma_only_tokens),
+            "near_opportunity_events": near_opp_count,
             "last_refresh": self._last_refresh.isoformat() if self._last_refresh else None,
         }

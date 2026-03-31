@@ -203,9 +203,31 @@ class ExecutionEngine:
 
         # Phase 1: Validate all orders before placing any
         validated_orders = []
+
+        # Phase 1a: Run slippage checks in PARALLEL for all legs
+        # This collapses N sequential HTTP calls into one parallel batch
+        if self.config.enable_slippage_check and signal.opportunity:
+            slippage_tasks = []
+            for order_spec in signal.orders:
+                market_id = order_spec.get("market_id", signal.market_id)
+                slippage_tasks.append(self._check_slippage_fresh(market_id, order_spec))
+
+            slippage_results = await asyncio.gather(*slippage_tasks, return_exceptions=True)
+
+            for i, result in enumerate(slippage_results):
+                if isinstance(result, Exception):
+                    logger.warning(f"Bundle rejected: slippage check error on leg {i}: {result}")
+                    return  # Abort entire bundle
+                if not result:
+                    token_type = signal.orders[i].get("token_type", "?")
+                    market_id = signal.orders[i].get("market_id", signal.market_id)
+                    self.stats.slippage_rejections += 1
+                    logger.warning(f"Bundle rejected: slippage on {token_type} in {market_id}")
+                    return  # Abort entire bundle
+
+        # Phase 1b: Check risk limits (local, no I/O)
         for order_spec in signal.orders:
             try:
-                # CRITICAL FIX: Use per-leg market_id if provided (for neg-risk)
                 market_id = order_spec.get("market_id", signal.market_id)
                 token_type = order_spec["token_type"]
                 side = order_spec["side"]
@@ -213,14 +235,6 @@ class ExecutionEngine:
                 size = order_spec["size"]
                 strategy_tag = order_spec.get("strategy_tag", "")
 
-                # Check slippage
-                if self.config.enable_slippage_check and signal.opportunity:
-                    if not await self._check_slippage_fresh(market_id, order_spec):
-                        self.stats.slippage_rejections += 1
-                        logger.warning(f"Bundle rejected: slippage on {token_type} in {market_id}")
-                        return  # Abort entire bundle
-
-                # Check risk limits
                 proposed_order = Order(
                     order_id="temp",
                     market_id=market_id,
