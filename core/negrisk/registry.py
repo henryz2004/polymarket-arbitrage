@@ -149,6 +149,24 @@ class NegriskRegistry:
                         if outcome.token_id:
                             new_token_map[outcome.token_id] = (event.event_id, outcome.outcome_id)
 
+            # Preserve WebSocket/CLOB-sourced BBA data from existing events.
+            # Registry refresh creates new Outcome objects with gamma-sourced BBA,
+            # which would destroy real-time price data from WebSocket. Carry forward
+            # any non-gamma BBA to the new outcome objects.
+            for event_id, new_event in new_events.items():
+                old_event = self._events.get(event_id)
+                if not old_event:
+                    continue
+                # Build lookup: token_id -> old outcome BBA
+                old_bba_by_token: dict[str, "OutcomeBBA"] = {}
+                for old_outcome in old_event.outcomes:
+                    if old_outcome.token_id and old_outcome.bba.source != "gamma":
+                        old_bba_by_token[old_outcome.token_id] = old_outcome.bba
+                # Carry forward non-gamma BBA to new outcomes
+                for new_outcome in new_event.outcomes:
+                    if new_outcome.token_id and new_outcome.token_id in old_bba_by_token:
+                        new_outcome.bba = old_bba_by_token[new_outcome.token_id]
+
             self._events = new_events
             self._token_to_outcome = new_token_map
             self._last_refresh = datetime.utcnow()
@@ -156,8 +174,9 @@ class NegriskRegistry:
             # Calculate priority scores for all events
             self._calculate_priority_scores()
 
+            mode_label = "all" if self.config.watchdog_mode else "neg-risk"
             logger.info(
-                f"Registry refreshed: {len(self._events)} neg-risk events, "
+                f"Registry refreshed: {len(self._events)} {mode_label} events, "
                 f"{len(self._token_to_outcome)} tokens"
             )
 
@@ -217,11 +236,18 @@ class NegriskRegistry:
             event.priority_score = round(score, 3)
 
     def _is_negrisk_event(self, event_data: dict) -> bool:
-        """Check if an event is a neg-risk event."""
-        # Check negRisk or enableNegRisk flag
-        neg_risk = event_data.get("negRisk", False) or event_data.get("enableNegRisk", False)
-        if not neg_risk:
-            return False
+        """Check if an event should be tracked.
+
+        In normal mode: only neg-risk events.
+        In watchdog mode: ALL events (neg-risk + non-neg-risk) so the watchdog
+        can monitor non-neg-risk multi-outcome markets like "US x Iran ceasefire by...?"
+        """
+        # In watchdog mode, accept all events (keyword filtering is done by WatchdogEngine)
+        if not self.config.watchdog_mode:
+            # Normal mode: require neg-risk flag
+            neg_risk = event_data.get("negRisk", False) or event_data.get("enableNegRisk", False)
+            if not neg_risk:
+                return False
 
         # Must have markets
         markets = event_data.get("markets", [])
@@ -269,13 +295,18 @@ class NegriskRegistry:
                 except (ValueError, TypeError, AttributeError):
                     pass
 
+            # Check actual neg-risk status from event data
+            is_neg_risk = bool(
+                event_data.get("negRisk", False) or event_data.get("enableNegRisk", False)
+            )
+
             event = NegriskEvent(
                 event_id=event_id,
                 slug=event_data.get("slug", ""),
                 title=event_data.get("title", "") or event_data.get("question", ""),
                 condition_id=event_data.get("conditionId", ""),
                 outcomes=outcomes,
-                neg_risk=True,
+                neg_risk=is_neg_risk,
                 neg_risk_augmented=neg_risk_augmented,
                 volume_24h=float(event_data.get("volume24hr", 0) or 0),
                 liquidity=float(event_data.get("liquidity", 0) or 0),

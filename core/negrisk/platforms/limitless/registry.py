@@ -16,6 +16,7 @@ import logging
 from datetime import datetime
 from typing import Optional
 
+from core.negrisk.fee_models import LimitlessFeeModel
 from core.negrisk.models import (
     NegriskConfig,
     NegriskEvent,
@@ -113,6 +114,20 @@ class LimitlessRegistry:
                         if outcome.token_id:
                             new_token_map[outcome.token_id] = (event.event_id, outcome.outcome_id)
 
+            # Preserve existing BBA data from the tracker.
+            # Without this, the refresh overwrites CLOB-sourced BBA (including
+            # best_ask=None for empty books) with stale gamma midpoint prices,
+            # causing false-positive opportunity alerts.
+            for event_id, new_event in new_events.items():
+                old_event = self._events.get(event_id)
+                if not old_event:
+                    continue
+                old_outcomes = {o.outcome_id: o for o in old_event.outcomes}
+                for outcome in new_event.outcomes:
+                    old = old_outcomes.get(outcome.outcome_id)
+                    if old and old.bba.source in ("clob", "websocket"):
+                        outcome.bba = old.bba
+
             self._events = new_events
             self._token_to_outcome = new_token_map
             self._last_refresh = datetime.utcnow()
@@ -148,13 +163,35 @@ class LimitlessRegistry:
 
             # Parse outcomes from sub-markets
             outcomes = []
+            api_yes_prices = []
             for sub in sub_markets:
                 outcome = self._parse_sub_market(sub, group_slug)
                 if outcome:
                     outcomes.append(outcome)
+                # Collect API YES prices for mutual-exclusivity check
+                prices = sub.get("prices", [])
+                if isinstance(prices, list) and len(prices) >= 2:
+                    try:
+                        api_yes_prices.append(float(prices[0]))
+                    except (ValueError, TypeError):
+                        pass
 
             if len(outcomes) < self.config.min_outcomes:
                 return None
+
+            # Filter non-mutually-exclusive groups: in a true neg-risk market,
+            # the sum of YES probabilities should be near 1.0. If it's well above
+            # 1.0 (e.g. 1.5+), the sub-markets are independent events, not
+            # mutually exclusive outcomes. Threshold: 1.5 to allow for market
+            # inefficiency in legit neg-risk markets while catching independent groups.
+            if api_yes_prices and len(api_yes_prices) >= 3:
+                sum_yes = sum(api_yes_prices)
+                if sum_yes > 1.5:
+                    logger.debug(
+                        f"Skipping non-mutually-exclusive group: {group_slug} "
+                        f"(sum of YES prices = {sum_yes:.2f}, expected ~1.0)"
+                    )
+                    return None
 
             # Parse expiration
             end_date = None
@@ -164,6 +201,38 @@ class LimitlessRegistry:
                     end_date = datetime.utcfromtimestamp(exp_ts / 1000.0)
                 except (ValueError, TypeError, OSError):
                     pass
+
+            # Skip expired events
+            if end_date and end_date < datetime.utcnow():
+                logger.debug(f"Skipping expired event: {group_slug} (expired {end_date})")
+                return None
+
+            # Skip events beyond max horizon
+            if end_date and self.config.max_horizon_days > 0:
+                from datetime import timedelta
+                max_end = datetime.utcnow() + timedelta(days=self.config.max_horizon_days)
+                if end_date > max_end:
+                    logger.debug(
+                        f"Skipping long-horizon event: {group_slug} "
+                        f"(ends {end_date.date()}, max horizon {self.config.max_horizon_days:.0f}d)"
+                    )
+                    return None
+
+            # Parse creation time
+            created_at = None
+            created_str = data.get("createdAt")
+            if created_str:
+                try:
+                    # ISO 8601 format: "2026-02-02T23:04:45.112Z"
+                    created_at = datetime.fromisoformat(created_str.replace("Z", "+00:00")).replace(tzinfo=None)
+                except (ValueError, TypeError):
+                    pass
+
+            # Estimate dynamic fee based on lifecycle position
+            fee_rate_bps = LimitlessFeeModel.estimate_fee_bps(
+                created_at=created_at,
+                end_date=end_date,
+            )
 
             event = NegriskEvent(
                 event_id=group_slug,
@@ -177,6 +246,8 @@ class LimitlessRegistry:
                 volume_24h=volume,
                 liquidity=0.0,
                 end_date=end_date,
+                created_at=created_at,
+                fee_rate_bps=fee_rate_bps,
                 last_updated=datetime.utcnow(),
             )
 
@@ -202,12 +273,12 @@ class LimitlessRegistry:
             title = sub.get("title", "")
             neg_risk_req = sub.get("negRiskRequestId")
 
-            # Parse initial prices — prices array is [no_price, yes_price]
+            # Parse initial prices — prices array is [yes_price, no_price]
             prices = sub.get("prices", [])
             best_ask = None
             if isinstance(prices, list) and len(prices) >= 2:
-                # prices[1] is the YES price
-                best_ask = float(prices[1])
+                # prices[0] is the YES price, prices[1] is the NO price
+                best_ask = float(prices[0])
 
             # Determine status
             status = OutcomeStatus.ACTIVE

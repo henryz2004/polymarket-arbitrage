@@ -60,6 +60,7 @@
 - **🛡️ Production Safety** - Stale data validation, signal deduplication, execution cooldowns, WS connectivity tracking
 - **📈 Depth-Adjusted Pricing** - Walks full order book depth for accurate fill prices
 - **🔍 Phantom Liquidity Detection** - Filters out opportunities backed only by Gamma API prices without real CLOB depth
+- **🔎 Suspicious Activity Watchdog** - Real-time scanner for insider trading signals: price spike detection, suspicion scoring, Google News correlation, NEWS-DRIVEN vs UNEXPLAINED classification
 
 ---
 
@@ -117,14 +118,21 @@ polymarket-arbitrage/
 │   ├── execution.py         # Order management with signal dedup + cooldowns
 │   ├── risk_manager.py      # Risk limits & kill switch
 │   ├── portfolio.py         # Position & PnL tracking
-│   └── negrisk/             # Neg-risk multi-outcome arbitrage
-│       ├── models.py        # Data models, config, BBA with source tracking + depth
-│       ├── registry.py      # Event discovery + priority scoring (resolution, volume)
-│       ├── bba_tracker.py   # Real-time BBA via WebSocket + CLOB seeding + WS health
-│       ├── detector.py      # BUY_ALL + SELL_ALL detection (taker/maker, depth-adjusted)
-│       ├── binary_detector.py # Binary YES+NO bundle detection
-│       ├── partial_detector.py # +EV partial subset detection (Kelly sizing)
-│       └── engine.py        # Orchestrator (ws_only_mode, priority sorting, cooldowns)
+│   ├── negrisk/             # Neg-risk multi-outcome arbitrage
+│   │   ├── models.py        # Data models, config, BBA with source tracking + depth
+│   │   ├── registry.py      # Event discovery + priority scoring (resolution, volume)
+│   │   ├── bba_tracker.py   # Real-time BBA via WebSocket + CLOB seeding + WS health
+│   │   ├── detector.py      # BUY_ALL + SELL_ALL detection (taker/maker, depth-adjusted)
+│   │   ├── binary_detector.py # Binary YES+NO bundle detection
+│   │   ├── partial_detector.py # +EV partial subset detection (Kelly sizing)
+│   │   └── engine.py        # Orchestrator (ws_only_mode, priority sorting, cooldowns)
+│   └── watchdog/            # Suspicious activity detection
+│       ├── models.py        # WatchdogConfig, AnomalyAlert (news_driven flag)
+│       ├── engine.py        # Orchestrator: discovery, BBA tracking, scan loop
+│       ├── price_tracker.py # Rolling price history, CLOB backfill
+│       ├── anomaly_detector.py # Spike detection + suspicion scoring (0-10)
+│       ├── news_checker.py  # Google News RSS correlation
+│       └── alert_dispatcher.py # Console + JSONL output (NEWS-DRIVEN/UNEXPLAINED)
 │
 ├── dashboard/                # Web dashboard
 │   ├── server.py            # FastAPI server
@@ -139,14 +147,17 @@ polymarket-arbitrage/
 │   ├── test_arb_engine.py
 │   ├── test_risk_manager.py
 │   ├── test_portfolio.py
-│   └── test_negrisk.py      # Neg-risk arbitrage tests
+│   ├── test_negrisk.py      # Neg-risk arbitrage tests
+│   └── test_watchdog.py     # Watchdog tests
 │
 ├── negrisk_long_test.py      # Long-term neg-risk testing script
+├── watchdog_runner.py        # Suspicious activity watchdog runner
 ├── NEGRISK_TESTING.md        # Neg-risk testing guide
 ├── polymarket_iran_market_analysis.md  # Iran strike market insider trading analysis
 │
 └── logs/                     # Log files (auto-created)
-    └── negrisk/              # Neg-risk test logs
+    ├── negrisk/              # Neg-risk test logs
+    └── watchdog/             # Watchdog alerts + stats
 ```
 
 ---
@@ -425,6 +436,29 @@ nohup python negrisk_long_test.py --duration 12 > /dev/null 2>&1 &
 ```
 
 Logs go to `logs/negrisk/` -- see `NEGRISK_TESTING.md` for full details on analyzing results.
+
+### Suspicious Activity Watchdog
+
+Scan Polymarket events for insider-trading-style price spikes, with automatic news correlation to distinguish NEWS-DRIVEN moves from UNEXPLAINED ones:
+
+```bash
+# Run watchdog for 24 hours (default)
+python watchdog_runner.py
+
+# Run with custom args
+python watchdog_runner.py --duration 24 --min-volume 10000
+
+# Watch specific event slugs
+python watchdog_runner.py --watch-slugs "us-strikes-iran,china-invades-taiwan"
+
+# Run in tmux (recommended for long runs)
+tmux new-session -d -s watchdog "caffeinate -i ./venv/bin/python3 watchdog_runner.py --duration 24"
+
+# Attach to see live output
+tmux attach -t watchdog
+```
+
+Alerts log to `logs/watchdog/alerts_YYYYMMDD.jsonl` with fields including `news_driven` (bool), `suspicion_score` (0-10), `is_off_hours`, and correlated `news_headlines`.
 
 ---
 

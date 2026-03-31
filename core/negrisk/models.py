@@ -104,11 +104,19 @@ class NegriskConfig:
     # CLOB re-seeding
     reseed_interval_seconds: float = 300.0  # Re-seed gamma-only tokens every 5 minutes
 
+    # Event horizon filter
+    max_horizon_days: float = 0            # Max days until resolution (0 = no limit)
+
     # Event prioritization
     prioritize_near_resolution: bool = True
     resolution_window_hours: float = 24.0      # Events resolving within this window get priority
     priority_edge_discount: float = 0.5        # Multiply min_net_edge by this for high-priority events
     volume_spike_threshold: float = 2.0        # 2x average volume = spike
+
+    # Watchdog mode: fetch ALL events from Gamma API (not just neg-risk)
+    # This allows the watchdog to discover non-neg-risk multi-outcome events
+    # like "US x Iran ceasefire by...?" that have significant insider trading signals
+    watchdog_mode: bool = False
 
 
 @dataclass
@@ -256,6 +264,10 @@ class NegriskEvent:
     volume_24h: float = 0.0
     liquidity: float = 0.0
     end_date: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+
+    # Per-event fee rate (used by Limitless dynamic fees; 0 = use model default)
+    fee_rate_bps: float = 0.0
 
     # Priority scoring
     priority_score: float = 0.0              # Higher = more priority (0.0-1.5 range)

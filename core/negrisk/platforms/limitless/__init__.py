@@ -17,10 +17,12 @@ from core.negrisk.platforms.limitless.api_client import LimitlessAPIClient
 from core.negrisk.platforms.limitless.registry import LimitlessRegistry
 from core.negrisk.platforms.limitless.bba_tracker import LimitlessBBATracker
 from core.negrisk.platforms.limitless.executor import LimitlessExecutor
+from core.negrisk.platforms.limitless.approvals import check_and_approve
 
 __all__ = [
     "LimitlessAPIClient",
     "LimitlessRegistry",
     "LimitlessBBATracker",
     "LimitlessExecutor",
+    "check_and_approve",
 ]

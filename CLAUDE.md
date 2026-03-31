@@ -36,6 +36,21 @@ python negrisk_long_test.py
 # Run neg-risk overnight test (12 hours, custom edge)
 python negrisk_long_test.py --duration 12 --edge 1.5
 
+# Run watchdog (suspicious activity scanner, 24h default)
+python watchdog_runner.py
+
+# Run watchdog with custom args
+python watchdog_runner.py --duration 24 --min-volume 10000
+
+# Run watchdog in tmux (recommended for long runs)
+tmux new-session -d -s watchdog "caffeinate -i ./venv/bin/python3 watchdog_runner.py --duration 24"
+
+# Attach to watchdog tmux session
+tmux attach -t watchdog
+
+# Run watchdog tests
+pytest tests/test_watchdog.py -v
+
 # Format code
 black .
 
@@ -57,6 +72,11 @@ TradingBot
 │   ├── NegriskDetector               #   Multi-outcome detection (BUY_ALL + SELL_ALL)
 │   ├── BinaryBundleDetector          #   Binary YES+NO bundle detection (BUY_BINARY + SELL_BINARY)
 │   └── PartialPositionDetector       #   +EV partial subset detection (not riskless, disabled by default)
+├── WatchdogEngine                    # Suspicious activity detection scanner
+│   ├── PriceTracker                  #   Rolling price history per token
+│   ├── AnomalyDetector               #   Spike detection + suspicion scoring
+│   ├── NewsChecker                   #   Google News RSS headline correlation
+│   └── AlertDispatcher               #   Console + JSONL alert output
 ├── ExecutionEngine                   # Order placement with signal dedup + cooldowns
 ├── RiskManager                       # Position/loss limits, kill switch
 ├── Portfolio                         # Position and PnL tracking
@@ -101,7 +121,14 @@ TradingBot
 - `kalshi_client/` - Kalshi REST client, data models
 - `dashboard/` - FastAPI server (server.py) with embedded HTML, bot integration
 - `utils/` - Config loading, logging setup, backtesting
-- `tests/` - Unit tests for arb engine, risk manager, portfolio, neg-risk
+- `core/watchdog/` - Suspicious activity detection:
+  - `models.py` - WatchdogConfig, AnomalyAlert (with `news_driven` flag), PriceSnapshot
+  - `engine.py` - Orchestrator: registry discovery, BBA tracking, scan loop, news enrichment
+  - `price_tracker.py` - Rolling price history per token, CLOB backfill, rate-limited sampling
+  - `anomaly_detector.py` - Spike detection (relative + absolute thresholds), suspicion scoring (0-10)
+  - `news_checker.py` - Google News RSS headline fetching, keyword extraction, date filtering
+  - `alert_dispatcher.py` - Console (colored) + JSONL file output, NEWS-DRIVEN vs UNEXPLAINED labels
+- `tests/` - Unit tests for arb engine, risk manager, portfolio, neg-risk, watchdog
 
 ## Configuration
 
@@ -154,9 +181,102 @@ Optional detectors:
 - `enable_partial_positions`: +EV partial subset detection (default false, NOT riskless)
 - `min_partial_ev` / `max_excluded_probability` / `partial_kelly_fraction`: Partial position params
 
+### Watchdog Config (in `WatchdogConfig` dataclass, `core/watchdog/models.py`)
+
+- `watch_keywords`: Geopolitical keywords to filter events (strike, war, attack, etc.)
+- `watch_slugs`: Force-watch specific event slugs
+- `min_event_volume_24h`: Minimum 24h volume to watch (default $10,000)
+- `relative_thresholds`: (pct_change, window_seconds) pairs — e.g. 50% in 1h, 100% in 4h
+- `absolute_thresholds`: (cent_move, window_seconds) pairs — e.g. 5c in 30min, 10c in 1h
+- `off_hours_utc`: Off-hours window for suspicion scoring (default 7-11 UTC = 2-6 AM EST)
+- `price_poll_interval_seconds`: Scan interval (default 60s)
+- `alert_cooldown_seconds`: Dedup window per token (default 300s)
+- `news_check_enabled`: Fetch Google News headlines for alert enrichment (default true)
+- `news_lookback_hours`: Only match headlines from the last N hours (default 6)
+- `warmup_seconds`: Don't fire alerts until N seconds of live data (default 300s)
+- `min_price_floor`: Ignore outcomes below this price (default 3c)
+
+Alert fields include `news_driven: bool` — `True` when correlated headlines found, `False` when unexplained (the real insider-trading signal). Alerts log to `logs/watchdog/alerts_YYYYMMDD.jsonl`.
+
 ### Long-Term Testing
 
 See `NEGRISK_TESTING.md` for detailed testing guide. Logs output to `logs/negrisk/`.
+
+## Polymarket API Reference (for CLOB order execution)
+
+### Documentation URLs
+- Full docs index: https://docs.polymarket.com/llms.txt
+- Order creation: https://docs.polymarket.com/trading/orders/create.md
+- Neg-risk trading: https://docs.polymarket.com/advanced/neg-risk.md
+- Fees: https://docs.polymarket.com/trading/fees.md
+- Authentication: https://docs.polymarket.com/api-reference/authentication.md
+- CTF operations: https://docs.polymarket.com/trading/ctf/overview.md
+- Contract addresses: https://docs.polymarket.com/resources/contract-addresses.md
+- WebSocket market: https://docs.polymarket.com/api-reference/wss/market.md
+- WebSocket user: https://docs.polymarket.com/api-reference/wss/user.md
+- Python SDK: https://github.com/Polymarket/py-clob-client
+
+### Contract Addresses (Polygon, Chain ID 137)
+- CTF Exchange: `0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E`
+- Neg Risk CTF Exchange: `0xC5d563A36AE78145C45a50134d48A1215220f80a`
+- Neg Risk Adapter: `0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296`
+- Conditional Tokens (CTF): `0x4D97DCd97eC945f40cF65F87097ACe5EA0476045`
+- USDC.e: `0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174`
+
+### py-clob-client Usage (pip install py-clob-client)
+```python
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType
+from py_clob_client.order_builder.constants import BUY, SELL
+
+# Read-only client
+client = ClobClient("https://clob.polymarket.com")
+
+# Trading client (EOA wallet, signature_type=0)
+client = ClobClient(
+    "https://clob.polymarket.com",
+    key="<private-key>",
+    chain_id=137,
+    signature_type=0,
+    funder="<wallet-address>"
+)
+client.set_api_creds(client.create_or_derive_api_creds())
+
+# Limit order (neg-risk market)
+order = client.create_order(OrderArgs(
+    token_id="<token-id>", price=0.50, size=10.0, side=BUY
+), options={"tickSize": "0.01", "negRisk": True})
+resp = client.post_order(order, OrderType.GTC)
+
+# Market order (FOK)
+mo = client.create_market_order(MarketOrderArgs(
+    token_id="<token-id>", amount=25.0, side=BUY, price=0.55  # worst price
+), options={"tickSize": "0.01", "negRisk": True})
+resp = client.post_order(mo, OrderType.FOK)
+
+# Batch orders (up to 15)
+orders = [{"order": signed_order, "orderType": OrderType.GTC}, ...]
+resp = client.post_orders(orders)
+```
+
+### Fee Structure (Taker only, Makers pay 0%)
+- `fee = shares * feeRate * p * (1-p)^exponent` (varies by category)
+- **Geopolitics: 0% fees** (most neg-risk events are geopolitical)
+- Politics/Finance/Tech: feeRate=0.04, peak 1.00%
+- Sports: feeRate=0.03, peak 0.75%
+- Crypto: feeRate=0.072, peak 1.80%
+- Fees peak at p=0.50, decrease toward extremes
+
+### Authentication Flow
+1. L1: Private key signs EIP-712 message → creates API creds (apiKey, secret, passphrase)
+2. L2: HMAC-SHA256 headers (POLY_ADDRESS, POLY_SIGNATURE, POLY_TIMESTAMP, POLY_API_KEY, POLY_PASSPHRASE)
+3. Orders require both L2 headers AND local EIP-712 signing via SDK
+
+### Neg-Risk Order Specifics
+- Must pass `negRisk=True` in order options for multi-outcome markets
+- USDC.e approval needed for: CTF Exchange, Neg Risk CTF Exchange, Neg Risk Adapter
+- Conditional Tokens approval needed for same three contracts
+- Tick size must be fetched per market (0.01 typical for most markets)
 
 ## Code Style
 

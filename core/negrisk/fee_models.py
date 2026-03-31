@@ -9,6 +9,9 @@ Each model encapsulates:
 - Gas cost per leg (varies by chain)
 """
 
+from datetime import datetime
+from typing import Optional
+
 
 class PolymarketFeeModel:
     """
@@ -31,11 +34,13 @@ class PolymarketFeeModel:
     def gas_per_leg(self) -> float:
         return self._gas_per_leg
 
-    def compute_fee_per_share(self, prices: list[float], side: str) -> float:
+    def compute_fee_per_share(self, prices: list[float], side: str, fee_rate_bps_override: Optional[float] = None) -> float:
         """
         Compute total taker fee per share across all legs.
 
         Uses the Polymarket CTF Exchange formula (CalculatorHelper.sol).
+        fee_rate_bps_override is accepted for interface compat but ignored —
+        Polymarket fee rates are set per-market in config, not per-event.
         """
         if self._fee_rate_bps == 0:
             return 0.0
@@ -57,13 +62,33 @@ class PolymarketFeeModel:
 
 class LimitlessFeeModel:
     """
-    Limitless Exchange fee model.
+    Limitless Exchange fee model with dynamic lifecycle-based fees.
 
-    Taker fee: 300 bps (3%) using the same CTF formula: fee_rate * min(p, 1-p).
+    Limitless uses a fee that scales over the market's lifetime:
+    - Near creation: ~3 bps (0.03%)
+    - Near resolution: ~300 bps (3%)
+
+    The API doesn't expose numeric fee rates (only metadata.fee boolean),
+    so we estimate based on the market's lifecycle position using
+    created_at and expiration_timestamp.
+
+    When a per-event fee_rate_bps is provided (stored on NegriskEvent),
+    that takes precedence over the fallback default.
+
     Gas: ~$0.001 per leg on Base chain.
     """
 
+    # Fee curve parameters (estimated from external sources)
+    MIN_FEE_BPS: float = 3.0      # ~0.03% at market creation
+    MAX_FEE_BPS: float = 300.0    # ~3% near resolution
+
     def __init__(self, fee_rate_bps: float = 300, gas_per_leg_usd: float = 0.001):
+        """
+        Args:
+            fee_rate_bps: Fallback fee rate when per-event rate is unavailable.
+                          300 bps (3%) is conservative — the worst-case near resolution.
+            gas_per_leg_usd: Gas cost per leg in dollars (~$0.001 on Base).
+        """
         self._fee_rate_bps = fee_rate_bps
         self._gas_per_leg = gas_per_leg_usd
 
@@ -71,16 +96,64 @@ class LimitlessFeeModel:
     def gas_per_leg(self) -> float:
         return self._gas_per_leg
 
-    def compute_fee_per_share(self, prices: list[float], side: str) -> float:
+    @staticmethod
+    def estimate_fee_bps(
+        created_at: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        now: Optional[datetime] = None,
+    ) -> float:
+        """
+        Estimate the current fee rate in bps based on market lifecycle position.
+
+        Linear interpolation from MIN_FEE_BPS at creation to MAX_FEE_BPS at expiry.
+
+        Args:
+            created_at: When the market was created
+            end_date: When the market expires/resolves
+            now: Current time (default: utcnow)
+
+        Returns:
+            Estimated fee in bps (3-300 range). Falls back to MAX_FEE_BPS
+            if timestamps are missing.
+        """
+        if not created_at or not end_date:
+            return LimitlessFeeModel.MAX_FEE_BPS
+
+        if now is None:
+            now = datetime.utcnow()
+
+        total_duration = (end_date - created_at).total_seconds()
+        if total_duration <= 0:
+            return LimitlessFeeModel.MAX_FEE_BPS
+
+        elapsed = (now - created_at).total_seconds()
+        fraction = max(0.0, min(1.0, elapsed / total_duration))
+
+        fee_range = LimitlessFeeModel.MAX_FEE_BPS - LimitlessFeeModel.MIN_FEE_BPS
+        return LimitlessFeeModel.MIN_FEE_BPS + fraction * fee_range
+
+    def compute_fee_per_share(
+        self,
+        prices: list[float],
+        side: str,
+        fee_rate_bps_override: Optional[float] = None,
+    ) -> float:
         """
         Compute total taker fee per share across all legs.
 
-        Same CTF formula as Polymarket but with fee_rate_bps=300 (3%).
+        Same CTF formula as Polymarket: fee_rate * min(p, 1-p) [/ p for BUY].
+
+        Args:
+            prices: List of per-leg prices
+            side: "BUY" or "SELL"
+            fee_rate_bps_override: Per-event fee rate (from NegriskEvent.fee_rate_bps).
+                                   If provided and > 0, overrides the instance default.
         """
-        if self._fee_rate_bps == 0:
+        rate = fee_rate_bps_override if fee_rate_bps_override and fee_rate_bps_override > 0 else self._fee_rate_bps
+        if rate == 0:
             return 0.0
 
-        base_rate = self._fee_rate_bps / 10000.0
+        base_rate = rate / 10000.0
         total_fee = 0.0
 
         for p in prices:

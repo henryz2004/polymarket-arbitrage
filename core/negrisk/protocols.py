@@ -7,6 +7,7 @@ Existing Polymarket classes (NegriskRegistry, BBATracker) already satisfy these
 protocols without modification — structural subtyping via typing.Protocol.
 """
 
+from datetime import datetime
 from typing import Callable, Optional, Protocol, runtime_checkable
 
 from core.negrisk.models import NegriskEvent, Outcome
@@ -48,4 +49,4 @@ class FeeModelProtocol(Protocol):
     @property
     def gas_per_leg(self) -> float: ...
 
-    def compute_fee_per_share(self, prices: list[float], side: str) -> float: ...
+    def compute_fee_per_share(self, prices: list[float], side: str, fee_rate_bps_override: Optional[float] = None) -> float: ...

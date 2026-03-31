@@ -9,6 +9,7 @@ Endpoints:
 - GET /markets/{slug}/orderbook  — bids/asks arrays for a sub-market
 """
 
+import asyncio
 import logging
 from typing import Optional
 
@@ -16,6 +17,10 @@ import httpx
 
 
 logger = logging.getLogger(__name__)
+
+# Retry config for 429 rate limits
+_MAX_RETRIES = 3
+_INITIAL_BACKOFF = 2.0  # seconds
 
 
 class LimitlessAPIClient:
@@ -37,6 +42,22 @@ class LimitlessAPIClient:
             await self._client.aclose()
             self._client = None
 
+    async def _request_with_retry(self, method: str, url: str, **kwargs) -> httpx.Response:
+        """Make an HTTP request with retry-on-429 and exponential backoff."""
+        backoff = _INITIAL_BACKOFF
+        for attempt in range(_MAX_RETRIES + 1):
+            resp = await self._client.request(method, url, **kwargs)
+            if resp.status_code != 429:
+                resp.raise_for_status()
+                return resp
+            if attempt < _MAX_RETRIES:
+                logger.debug(f"429 rate-limited on {url}, retrying in {backoff:.0f}s (attempt {attempt + 1}/{_MAX_RETRIES})")
+                await asyncio.sleep(backoff)
+                backoff *= 2
+        # Final attempt was also 429 — raise
+        resp.raise_for_status()
+        return resp  # unreachable, raise_for_status throws
+
     async def get_active_markets(self, page: int = 1) -> dict:
         """
         Fetch a page of active markets.
@@ -47,11 +68,11 @@ class LimitlessAPIClient:
         Returns:
             Dict with 'data' (list of markets) and 'totalMarketsCount'.
         """
-        resp = await self._client.get(
+        resp = await self._request_with_retry(
+            "GET",
             f"{self.BASE_URL}/markets/active",
             params={"page": page},
         )
-        resp.raise_for_status()
         return resp.json()
 
     async def get_all_active_markets(self) -> list[dict]:
@@ -92,8 +113,8 @@ class LimitlessAPIClient:
             Dict with 'bids', 'asks', 'tokenId', 'midpoint', etc.
             Bids/asks entries: {"price": float, "size": int, "side": str}
         """
-        resp = await self._client.get(
+        resp = await self._request_with_retry(
+            "GET",
             f"{self.BASE_URL}/markets/{slug}/orderbook",
         )
-        resp.raise_for_status()
         return resp.json()

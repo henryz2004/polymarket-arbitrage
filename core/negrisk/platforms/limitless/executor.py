@@ -9,14 +9,30 @@ of through the Polymarket ExecutionEngine. This avoids coupling to Polymarket-sp
 models (Signal, Order, OrderBook).
 
 Execution flow:
-1. Pre-flight: Fresh slippage check on each leg via api_client.get_orderbook()
-2. Execute: Sequential FOK orders for each leg. Abort on first failure.
-3. Rollback: If legs 1-N filled but leg N+1 failed, sell legs 1-N back.
+1. Pre-flight: Kill switch check, max trade size cap, USDC balance check
+2. Slippage check on each leg via api_client.get_orderbook()
+3. Sequential FOK orders for each leg. Abort on first failure.
+4. Rollback: If legs 1-N filled but leg N+1 failed, sell legs 1-N back.
+
+Pre-flight:
+  1. Get Limitless API key: https://limitless.exchange (account settings)
+  2. Fund Base (chain 8453) wallet with USDC
+     - Bridge from Ethereum: https://bridge.base.org
+     - Or buy directly on Base via Coinbase
+  3. Export env vars:
+       export LIMITLESS_API_KEY="your_key"
+       export LIMITLESS_PRIVATE_KEY="0xyour_private_key"
+  4. Run approvals once:
+       python negrisk_long_test.py --platform limitless --setup-approvals
+  5. Test with small trade:
+       python negrisk_long_test.py --platform limitless --duration 0.1 --edge 3 --execute --max-size 20
+  6. Kill switch: touch KILL_SWITCH to immediately halt all execution
 """
 
 import logging
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from core.negrisk.models import NegriskOpportunity
@@ -67,6 +83,9 @@ class LimitlessExecutor:
         private_key: Optional[str] = None,
         dry_run: bool = True,
         slippage_tolerance: float = 0.02,
+        max_trade_usd: float = 50.0,
+        kill_switch_path: str = "KILL_SWITCH",
+        rpc_url: str = "https://mainnet.base.org",
     ):
         """
         Initialize the Limitless executor.
@@ -77,15 +96,23 @@ class LimitlessExecutor:
             private_key: Wallet private key for signing (required for live)
             dry_run: If True, simulate without placing real orders
             slippage_tolerance: Max allowed price movement since detection (2%)
+            max_trade_usd: Hard cap on total cost per opportunity (default $50)
+            kill_switch_path: If this file exists, refuse to execute
+            rpc_url: Base chain RPC URL for balance checks
         """
         self.api_client = api_client
         self.api_key = api_key
         self.private_key = private_key
         self.dry_run = dry_run
         self.slippage_tolerance = slippage_tolerance
+        self.max_trade_usd = max_trade_usd
+        self.kill_switch_path = kill_switch_path
+        self.rpc_url = rpc_url
 
         # SDK clients (initialized in initialize())
         self._order_client = None
+        self._market_fetcher = None
+        self._wallet_address: Optional[str] = None
         self._initialized = False
 
         # Stats
@@ -121,11 +148,14 @@ class LimitlessExecutor:
         try:
             from limitless_sdk.orders import OrderClient
             from limitless_sdk.api import HttpClient
+            from limitless_sdk.markets import MarketFetcher
             from eth_account import Account
 
             wallet = Account.from_key(self.private_key)
+            self._wallet_address = wallet.address
             http_client = HttpClient(api_key=self.api_key)
             self._order_client = OrderClient(http_client=http_client, wallet=wallet)
+            self._market_fetcher = MarketFetcher(http_client)
             self._initialized = True
             logger.info(f"LimitlessExecutor initialized for live execution (wallet={wallet.address})")
         except ImportError as e:
@@ -155,12 +185,41 @@ class LimitlessExecutor:
         self._stats["opportunities_received"] += 1
         start_time = time.monotonic()
 
+        # Kill switch — abort immediately if file exists
+        if Path(self.kill_switch_path).exists():
+            return ExecutionResult(success=False, reason="KILL SWITCH ACTIVE — execution halted")
+
+        # Max trade size cap
+        total_cost_estimate = sum(leg["price"] * leg["size"] for leg in opportunity.legs)
+        if total_cost_estimate > self.max_trade_usd:
+            return ExecutionResult(
+                success=False,
+                reason=f"Trade cost ${total_cost_estimate:.2f} exceeds max ${self.max_trade_usd:.2f}",
+            )
+
         # Dry-run mode: simulate and return
         if self.dry_run:
             return self._simulate_execution(opportunity)
 
         # Live execution
         self._stats["executions_attempted"] += 1
+
+        # USDC balance pre-check
+        try:
+            balance = await self._check_balance()
+            if balance < total_cost_estimate * 1.05:  # 5% buffer
+                return ExecutionResult(
+                    success=False,
+                    reason=f"Insufficient USDC: have ${balance:.2f}, need ${total_cost_estimate:.2f}",
+                )
+        except Exception as e:
+            logger.warning(f"Balance check failed (proceeding anyway): {e}")
+
+        logger.info(
+            f"LIVE EXECUTION: {opportunity.direction.value} on {opportunity.event.title[:60]} | "
+            f"{len(opportunity.legs)} legs | estimated_cost=${total_cost_estimate:.2f} | "
+            f"net_edge={opportunity.net_edge:.4f} ({opportunity.net_edge*100:.2f}%)"
+        )
 
         # Step 1: Pre-flight slippage check on all legs
         for leg in opportunity.legs:
@@ -218,6 +277,31 @@ class LimitlessExecutor:
             total_cost=total_cost,
             execution_time_ms=elapsed,
         )
+
+    async def _check_balance(self) -> float:
+        """Read wallet USDC balance on Base chain via eth_call."""
+        import aiohttp
+
+        if not self._wallet_address:
+            raise RuntimeError("Wallet address not set — call initialize() first")
+
+        # balanceOf(address) selector = 0x70a08231
+        addr_padded = self._wallet_address[2:].lower().zfill(64)
+        data = f"0x70a08231{addr_padded}"
+
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_call",
+            "params": [{"to": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "data": data}, "latest"],
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(self.rpc_url, json=payload) as resp:
+                result = await resp.json()
+                hex_val = result.get("result", "0x0")
+                raw_balance = int(hex_val, 16)
+                return raw_balance / 10**6  # USDC has 6 decimals
 
     async def _check_leg_slippage(self, leg: dict) -> bool:
         """
@@ -277,7 +361,7 @@ class LimitlessExecutor:
             LegOrderResult with fill details
         """
         try:
-            from limitless_sdk.orders import Side, OrderType
+            from limitless_sdk.types.orders import Side, OrderType
 
             sdk_side = Side.BUY if leg["side"] == "BUY" else Side.SELL
             maker_amount = leg["price"] * leg["size"]  # USDC to spend
@@ -290,9 +374,33 @@ class LimitlessExecutor:
                 market_slug=leg["market_id"],
             )
 
-            # Parse SDK response
-            order_id = result.get("id") or result.get("order_id", "")
-            filled = result.get("filled_size", leg["size"])
+            # Parse SDK response (OrderResponse object, not dict)
+            order_id = result.order.id
+
+            # FOK: check maker_matches for fill info
+            if result.maker_matches and len(result.maker_matches) > 0:
+                filled = sum(float(m.matched_size) for m in result.maker_matches)
+            else:
+                filled = 0.0  # FOK not filled — no matching liquidity
+
+            logger.info(
+                f"SDK order response: order_id={order_id} "
+                f"maker_matches={len(result.maker_matches or [])} "
+                f"filled={filled:.2f} requested={leg['size']:.0f}"
+            )
+
+            if filled == 0.0:
+                return LegOrderResult(
+                    success=False,
+                    order_id=order_id,
+                    token_id=leg["token_id"],
+                    market_slug=leg["market_id"],
+                    side=leg["side"],
+                    price=leg["price"],
+                    size=leg["size"],
+                    filled_size=0.0,
+                    error="FOK not filled — no liquidity",
+                )
 
             return LegOrderResult(
                 success=True,

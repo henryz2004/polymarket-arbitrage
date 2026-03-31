@@ -54,6 +54,7 @@ class NegriskEngine:
         scan_only: bool = False,
         platform: str = "polymarket",
         limitless_executor=None,
+        polymarket_executor=None,
     ):
         """
         Initialize the neg-risk engine.
@@ -68,6 +69,7 @@ class NegriskEngine:
             scan_only: If True, detect only — no Signal creation or execution
             platform: Platform identifier for logging
             limitless_executor: LimitlessExecutor for Limitless order placement (None = no execution)
+            polymarket_executor: PolymarketExecutor for Polymarket order placement (None = fallback to ExecutionEngine)
         """
         self.config = config
         self.execution_engine = execution_engine
@@ -75,6 +77,7 @@ class NegriskEngine:
         self.scan_only = scan_only
         self.platform = platform
         self.limitless_executor = limitless_executor
+        self.polymarket_executor = polymarket_executor
 
         # Core components — use injected or default Polymarket implementations
         self.registry = registry if registry is not None else NegriskRegistry(config)
@@ -277,7 +280,7 @@ class NegriskEngine:
             yes_bba=tradeable[0].bba,
             no_bba=tradeable[1].bba,
             volume_24h=event.volume_24h,
-            fee_rate_bps=self.config.taker_fee_bps,
+            fee_rate_bps=self.config.fee_rate_bps,
         )
 
     async def _scan_loop(self) -> None:
@@ -441,6 +444,22 @@ class NegriskEngine:
                 else:
                     self.detector.stats.execution_failures += 1
                     logger.warning(f"[limitless] Execution failed: {result.reason}")
+                return
+
+            # Polymarket platform: route to PolymarketExecutor (if provided)
+            if self.platform == "polymarket" and self.polymarket_executor:
+                result = await self.polymarket_executor.execute_opportunity(opportunity)
+                if result.success:
+                    self.detector.stats.opportunities_submitted += 1
+                    self.detector.mark_executed(opportunity.opportunity_id)
+                    logger.info(
+                        f"[polymarket] Executed: {opportunity.opportunity_id} "
+                        f"({result.reason}) cost=${result.total_cost:.2f} "
+                        f"time={result.execution_time_ms:.0f}ms"
+                    )
+                else:
+                    self.detector.stats.execution_failures += 1
+                    logger.warning(f"[polymarket] Execution failed: {result.reason}")
                 return
 
             # Per-event execution cooldown to prevent double-execution

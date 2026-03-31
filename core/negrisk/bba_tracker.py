@@ -44,6 +44,7 @@ class BBATracker:
         registry: NegriskRegistry,
         config: NegriskConfig,
         on_price_update: Optional[Callable[[str, str], None]] = None,
+        token_filter: Optional[Callable[[], list[str]]] = None,
     ):
         """
         Initialize the BBA tracker.
@@ -52,10 +53,15 @@ class BBATracker:
             registry: The neg-risk registry to update
             config: Configuration
             on_price_update: Callback (event_id, token_id) when prices update
+            token_filter: Optional callable that returns a filtered list of
+                token IDs to subscribe to. If None, subscribes to all registry
+                tokens. Used by the watchdog to only subscribe to watched tokens
+                instead of all 10K+ registry tokens, preventing WS timeouts.
         """
         self.registry = registry
         self.config = config
         self.on_price_update = on_price_update
+        self._token_filter = token_filter
 
         self._http_client: Optional[httpx.AsyncClient] = None
         self._ws_task: Optional[asyncio.Task] = None
@@ -131,8 +137,11 @@ class BBATracker:
 
     async def _run_websocket(self) -> None:
         """Run a single WebSocket connection session."""
-        # Get all token IDs from registry
-        token_ids = self.registry.get_all_token_ids()
+        # Get token IDs — use filter if provided (watchdog), else all registry tokens
+        if self._token_filter:
+            token_ids = self._token_filter()
+        else:
+            token_ids = self.registry.get_all_token_ids()
 
         if not token_ids:
             logger.debug("No tokens to subscribe, waiting...")
@@ -269,12 +278,20 @@ class BBATracker:
         PERFORMANCE FIX: Don't fetch from CLOB on every price change.
         WebSocket book events provide BBA data, and we fetch fresh from
         CLOB before execution anyway. Just trigger the callback.
+
+        GAMMA GUARD: Only fire callback if the outcome has real BBA data
+        (websocket/clob sourced). After a registry refresh, outcomes reset
+        to gamma-sourced BBA — firing the callback then would cause the
+        watchdog to sample stale gamma prices as live data.
         """
         # Trigger callback to notify engine of price change
         if self.on_price_update:
             result = self.registry.get_event_by_token(token_id)
             if result:
                 event_obj, outcome = result
+                # Don't fire callback on gamma-sourced BBA — no real price data
+                if outcome.bba.source == "gamma":
+                    return
                 self.on_price_update(event_obj.event_id, token_id)
 
     async def _fetch_clob_price(self, token_id: str) -> bool:

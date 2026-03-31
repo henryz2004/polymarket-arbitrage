@@ -357,7 +357,9 @@ class NegriskDetector:
         gas_per_share = total_gas_cost / suggested_size if suggested_size > 0 else total_gas_cost
 
         # Fee per share using platform-specific fee model
-        fee_per_share = self.fee_model.compute_fee_per_share(asks, "BUY")
+        # Pass per-event fee rate if available (Limitless dynamic fees)
+        fee_override = event.fee_rate_bps if event.fee_rate_bps > 0 else None
+        fee_per_share = self.fee_model.compute_fee_per_share(asks, "BUY", fee_rate_bps_override=fee_override)
 
         # Net edge (all per-share metrics now)
         net_edge = gross_edge - fee_per_share - gas_per_share
@@ -764,7 +766,8 @@ class NegriskDetector:
         gas_per_share = total_gas_cost / suggested_size if suggested_size > 0 else total_gas_cost
 
         # Fee per share using platform-specific fee model
-        fee_per_share = self.fee_model.compute_fee_per_share(bids, "SELL")
+        fee_override = event.fee_rate_bps if event.fee_rate_bps > 0 else None
+        fee_per_share = self.fee_model.compute_fee_per_share(bids, "SELL", fee_rate_bps_override=fee_override)
 
         # Net edge: proceeds - payout - fees - gas
         net_edge = gross_edge - fee_per_share - gas_per_share
@@ -1070,7 +1073,8 @@ class NegriskDetector:
 
         # Fee per share using platform-specific fee model
         side = "SELL" if is_sell else "BUY"
-        fee_per_share = self.fee_model.compute_fee_per_share(prices, side)
+        fee_override = event.fee_rate_bps if event.fee_rate_bps > 0 else None
+        fee_per_share = self.fee_model.compute_fee_per_share(prices, side, fee_rate_bps_override=fee_override)
 
         # Net edge
         if is_sell:

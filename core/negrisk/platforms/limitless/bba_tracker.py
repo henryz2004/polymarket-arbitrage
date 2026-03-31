@@ -63,6 +63,7 @@ class LimitlessBBATracker:
         self._rest_fetches: int = 0
         self._empty_books: int = 0
         self._fetch_errors: int = 0
+        self._phantom_filtered: int = 0
         self._last_fetch: Optional[datetime] = None
 
     async def start(self) -> None:
@@ -142,8 +143,17 @@ class LimitlessBBATracker:
                 self._last_fetch = datetime.utcnow()
                 self.last_ws_message_at = self._last_fetch
 
-                bids = data.get("bids", [])
-                asks = data.get("asks", [])
+                # Filter phantom/placeholder levels (market-maker minSize stubs)
+                min_size_raw = int(data.get("minSize", 0) or 0)
+                raw_bids = data.get("bids", [])
+                raw_asks = data.get("asks", [])
+                bids = self._filter_phantom_levels(raw_bids, min_size_raw)
+                asks = self._filter_phantom_levels(raw_asks, min_size_raw)
+
+                if len(bids) < len(raw_bids) or len(asks) < len(raw_asks):
+                    self._phantom_filtered += (
+                        len(raw_bids) - len(bids) + len(raw_asks) - len(asks)
+                    )
 
                 best_bid = float(bids[0]["price"]) if bids else None
                 best_ask = float(asks[0]["price"]) if asks else None
@@ -194,6 +204,19 @@ class LimitlessBBATracker:
         except (ValueError, TypeError):
             return 0.0
 
+    @staticmethod
+    def _filter_phantom_levels(levels: list[dict], min_size_raw: int) -> list[dict]:
+        """
+        Filter out phantom/placeholder levels from the orderbook.
+
+        Market makers on Limitless are required to maintain orders at minSize.
+        Levels at exactly minSize are stub obligations, not real liquidity.
+        We keep levels that are strictly above minSize.
+        """
+        if not min_size_raw:
+            return levels
+        return [lv for lv in levels if int(lv.get("size", 0)) > min_size_raw]
+
     async def fetch_all_prices(self, event: NegriskEvent) -> dict:
         """
         Fetch fresh prices from orderbook for all outcomes in an event.
@@ -210,8 +233,10 @@ class LimitlessBBATracker:
                 data = await self._api_client.get_orderbook(outcome.market_id)
                 self._rest_fetches += 1
 
-                bids = data.get("bids", [])
-                asks = data.get("asks", [])
+                # Filter phantom/placeholder levels
+                min_size_raw = int(data.get("minSize", 0) or 0)
+                bids = self._filter_phantom_levels(data.get("bids", []), min_size_raw)
+                asks = self._filter_phantom_levels(data.get("asks", []), min_size_raw)
 
                 best_bid = float(bids[0]["price"]) if bids else None
                 best_ask = float(asks[0]["price"]) if asks else None
@@ -271,6 +296,7 @@ class LimitlessBBATracker:
             "rest_fetches": self._rest_fetches,
             "empty_books": self._empty_books,
             "fetch_errors": self._fetch_errors,
+            "phantom_filtered": self._phantom_filtered,
             "last_fetch": self._last_fetch.isoformat() if self._last_fetch else None,
             "ws_connected": self.ws_connected,
         }

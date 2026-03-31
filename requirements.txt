@@ -23,6 +23,13 @@ uvicorn>=0.24.0
 pytest>=7.4.0
 pytest-asyncio>=0.21.0
 
+# Polymarket CLOB SDK
+py-clob-client>=0.1.0
+
+# Limitless Exchange SDK
+limitless-sdk>=1.0.0
+eth-account>=0.11.0
+
 # Development
 black>=23.0.0
 mypy>=1.7.0
