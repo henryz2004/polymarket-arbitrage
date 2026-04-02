@@ -6,7 +6,7 @@ Kalshi-specific data structures that map to our unified trading models.
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from polymarket_client.models import PriceLevel, OrderBookSide, TokenOrderBook, OrderBook, TokenType
 
@@ -152,4 +152,88 @@ class KalshiSeries:
     title: str
     frequency: str  # daily, weekly, etc.
     category: str
+
+
+@dataclass
+class KalshiCandlestick:
+    """
+    A single candlestick from the Kalshi candlestick API.
+
+    All dollar values are floats (parsed from FixedPointDollars strings).
+    """
+    end_period_ts: int                     # Unix timestamp (end of period)
+
+    # Trade price OHLC
+    price_open: Optional[float] = None
+    price_high: Optional[float] = None
+    price_low: Optional[float] = None
+    price_close: Optional[float] = None
+    price_mean: Optional[float] = None
+    price_previous: Optional[float] = None
+
+    # YES bid OHLC
+    yes_bid_open: Optional[float] = None
+    yes_bid_high: Optional[float] = None
+    yes_bid_low: Optional[float] = None
+    yes_bid_close: Optional[float] = None
+
+    # YES ask OHLC
+    yes_ask_open: Optional[float] = None
+    yes_ask_high: Optional[float] = None
+    yes_ask_low: Optional[float] = None
+    yes_ask_close: Optional[float] = None
+
+    # Volume and open interest
+    volume: float = 0.0
+    open_interest: float = 0.0
+
+    @property
+    def timestamp(self) -> datetime:
+        return datetime.fromtimestamp(self.end_period_ts, tz=timezone.utc)
+
+    @property
+    def mid_price(self) -> Optional[float]:
+        """Best mid-price estimate: trade close > bid/ask mid > bid close."""
+        if self.price_close is not None:
+            return self.price_close
+        if self.yes_bid_close is not None and self.yes_ask_close is not None:
+            return (self.yes_bid_close + self.yes_ask_close) / 2
+        if self.yes_bid_close is not None:
+            return self.yes_bid_close
+        return self.yes_ask_close
+
+
+@dataclass
+class KalshiTrade:
+    """A single trade execution from the Kalshi trade feed."""
+    trade_id: str
+    market_ticker: str
+    side: str             # "yes" or "no"
+    price: float          # In dollars
+    count: float          # Number of contracts
+    ts: int               # Unix timestamp (seconds)
+
+    @property
+    def timestamp(self) -> datetime:
+        return datetime.fromtimestamp(self.ts, tz=timezone.utc)
+
+    @property
+    def dollar_value(self) -> float:
+        """Total dollar value of this trade."""
+        return self.price * self.count
+
+
+@dataclass
+class KalshiTickerUpdate:
+    """A real-time ticker update from WebSocket."""
+    market_ticker: str
+    yes_bid: Optional[float] = None     # In dollars
+    yes_ask: Optional[float] = None     # In dollars
+    last_price: Optional[float] = None  # In dollars
+    volume: float = 0.0
+    open_interest: float = 0.0
+    yes_bid_size: float = 0.0
+    yes_ask_size: float = 0.0
+    last_trade_size: float = 0.0
+    ts: int = 0                         # Unix timestamp (seconds)
 

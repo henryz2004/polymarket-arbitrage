@@ -524,7 +524,7 @@ class TestSuspicionScoring:
         assert 3.0 <= score <= 6.0
 
     def test_near_resolution_penalty(self):
-        """Price landing near resolution gets a -2 score penalty."""
+        """Price landing near resolution gets a -3 score penalty."""
         config = make_config()
         detector = AnomalyDetector(config)
 
@@ -539,7 +539,7 @@ class TestSuspicionScoring:
             now=datetime(2026, 1, 1, 15, 0), price_after=0.96,
         )
 
-        assert score_normal - score_resolution == pytest.approx(2.0)
+        assert score_normal - score_resolution == pytest.approx(3.0)
 
     def test_off_hours_detection(self):
         """Off-hours flag works correctly."""
@@ -781,3 +781,668 @@ class TestWatchedMarket:
             event_title="Test", event_slug="test", event_volume_24h=1000,
         )
         assert market.current_price is None
+
+
+# ──────────────────────────────────────────────────────────────
+# Gap-Aware Price Change Tests
+# ──────────────────────────────────────────────────────────────
+
+class TestGapAwarePriceChange:
+    """Test that price change detection handles data gaps correctly."""
+
+    def test_gap_detects_spike(self):
+        """A 12-hour data gap followed by a price jump is detected, not invisible."""
+        config = make_config()
+        tracker = PriceTracker(config)
+        event = make_event()
+        tracker.add_watch(event, event.outcomes[0])
+        market = tracker.get_watched_markets()["token_yes"]
+
+        now = datetime.utcnow()
+        # Simulate: price at 0.225 twelve hours ago, then 0.335 now (no data in between)
+        history = deque([
+            PriceSnapshot(timestamp=now - timedelta(hours=12), mid_price=0.225, source="websocket"),
+            PriceSnapshot(timestamp=now, mid_price=0.335, source="websocket"),
+        ])
+        inject_history(market, history)
+
+        # 1-hour window: should still detect the 11c move by using the 12h-old baseline
+        result = tracker.get_price_change("token_yes", 3600)
+        assert result is not None
+        price_before, price_now, pct_change = result
+        assert price_before == pytest.approx(0.225)
+        assert price_now == pytest.approx(0.335)
+        assert pct_change == pytest.approx((0.335 - 0.225) / 0.225, rel=0.01)
+
+    def test_gap_abs_change_detected(self):
+        """Absolute change through a data gap is correctly reported."""
+        config = make_config()
+        tracker = PriceTracker(config)
+        event = make_event()
+        tracker.add_watch(event, event.outcomes[0])
+        market = tracker.get_watched_markets()["token_yes"]
+
+        now = datetime.utcnow()
+        history = deque([
+            PriceSnapshot(timestamp=now - timedelta(hours=6), mid_price=0.10, source="websocket"),
+            PriceSnapshot(timestamp=now, mid_price=0.22, source="websocket"),
+        ])
+        inject_history(market, history)
+
+        result = tracker.get_abs_change("token_yes", 3600)
+        assert result is not None
+        _, _, abs_change = result
+        assert abs_change == pytest.approx(0.12, abs=0.001)
+
+    def test_no_gap_still_works(self):
+        """Normal continuous data still picks the correct baseline."""
+        config = make_config()
+        tracker = PriceTracker(config)
+        event = make_event()
+        tracker.add_watch(event, event.outcomes[0])
+        market = tracker.get_watched_markets()["token_yes"]
+
+        now = datetime.utcnow()
+        # 5 data points, 10 min apart, spanning 40 min
+        history = make_price_history(
+            prices=[0.20, 0.21, 0.22, 0.23, 0.30],
+            interval_seconds=600,
+            start_time=now - timedelta(minutes=40),
+        )
+        inject_history(market, history)
+
+        # 30-min window: baseline should be the snapshot at/before cutoff (now-30min)
+        result = tracker.get_price_change("token_yes", 1800)
+        assert result is not None
+        price_before, price_now, _ = result
+        # Cutoff = now - 30min. Snapshot at -40min is before cutoff, -30min is at cutoff.
+        # The snapshot at -30min (0.21) should be the baseline.
+        assert price_before == pytest.approx(0.21, abs=0.01)
+        assert price_now == pytest.approx(0.30)
+
+    def test_gap_with_only_recent_data(self):
+        """When all data is within the window, uses oldest as baseline."""
+        config = make_config()
+        tracker = PriceTracker(config)
+        event = make_event()
+        tracker.add_watch(event, event.outcomes[0])
+        market = tracker.get_watched_markets()["token_yes"]
+
+        now = datetime.utcnow()
+        # Both snapshots within the last 10 minutes, window is 1 hour
+        history = deque([
+            PriceSnapshot(timestamp=now - timedelta(minutes=5), mid_price=0.15, source="websocket"),
+            PriceSnapshot(timestamp=now, mid_price=0.25, source="websocket"),
+        ])
+        inject_history(market, history)
+
+        result = tracker.get_price_change("token_yes", 3600)
+        assert result is not None
+        price_before, price_now, _ = result
+        assert price_before == pytest.approx(0.15)
+        assert price_now == pytest.approx(0.25)
+
+
+# ──────────────────────────────────────────────────────────────
+# Cross-Market Correlation Tests
+# ──────────────────────────────────────────────────────────────
+
+class TestCorrelatedMarkets:
+    """Test cross-market correlation detection."""
+
+    def _make_multi_outcome_event(self, event_id="ceasefire1",
+                                   title="US x Iran ceasefire by",
+                                   n_outcomes=5) -> NegriskEvent:
+        """Create a multi-outcome event with N date outcomes."""
+        outcomes = []
+        for i in range(n_outcomes):
+            outcomes.append(Outcome(
+                outcome_id=f"o{i}",
+                market_id=f"m{i}",
+                condition_id=f"c{i}",
+                token_id=f"token_{event_id}_{i}",
+                name=f"Outcome {i}",
+                status=OutcomeStatus.ACTIVE,
+                bba=OutcomeBBA(best_bid=0.10, best_ask=0.12),
+            ))
+        return NegriskEvent(
+            event_id=event_id,
+            slug="ceasefire-by",
+            title=title,
+            condition_id="cond_ceasefire",
+            outcomes=outcomes,
+            volume_24h=100000.0,
+        )
+
+    def test_correlated_up_moves_detected(self):
+        """3+ outcomes moving up together triggers a correlated alert."""
+        config = make_config()
+        tracker = PriceTracker(config)
+        detector = AnomalyDetector(config)
+
+        event = self._make_multi_outcome_event(n_outcomes=5)
+        for outcome in event.outcomes:
+            tracker.add_watch(event, outcome)
+
+        now = datetime.utcnow()
+        # All 5 outcomes move up by 3-5c in last hour
+        for i, outcome in enumerate(event.outcomes):
+            market = tracker.get_watched_markets()[outcome.token_id]
+            base_price = 0.15 + i * 0.05  # 15c, 20c, 25c, 30c, 35c
+            move = 0.03 + i * 0.005       # 3c, 3.5c, 4c, 4.5c, 5c
+            history = deque([
+                PriceSnapshot(timestamp=now - timedelta(hours=2), mid_price=base_price, source="websocket"),
+                PriceSnapshot(timestamp=now, mid_price=base_price + move, source="websocket"),
+            ])
+            inject_history(market, history)
+
+        alerts = detector.check_correlated_markets(tracker)
+        assert len(alerts) == 1
+
+        alert = alerts[0]
+        assert alert.threshold_type == "correlated"
+        assert alert.correlated_outcomes == 5
+        assert alert.direction == "up"
+        assert alert.suspicion_score > 0
+
+    def test_correlated_down_moves_detected(self):
+        """3+ outcomes moving down together triggers a sell-side correlated alert."""
+        config = make_config()
+        tracker = PriceTracker(config)
+        detector = AnomalyDetector(config)
+
+        event = self._make_multi_outcome_event(n_outcomes=4)
+        for outcome in event.outcomes:
+            tracker.add_watch(event, outcome)
+
+        now = datetime.utcnow()
+        for i, outcome in enumerate(event.outcomes):
+            market = tracker.get_watched_markets()[outcome.token_id]
+            history = deque([
+                PriceSnapshot(timestamp=now - timedelta(hours=1), mid_price=0.30, source="websocket"),
+                PriceSnapshot(timestamp=now, mid_price=0.25, source="websocket"),
+            ])
+            inject_history(market, history)
+
+        alerts = detector.check_correlated_markets(tracker)
+        assert len(alerts) == 1
+        assert alerts[0].direction == "down"
+        assert alerts[0].correlated_outcomes == 4
+
+    def test_too_few_movers_no_alert(self):
+        """Only 2 outcomes moving (below min_correlated=3) produces no alert."""
+        config = make_config()
+        tracker = PriceTracker(config)
+        detector = AnomalyDetector(config)
+
+        event = self._make_multi_outcome_event(n_outcomes=5)
+        for outcome in event.outcomes:
+            tracker.add_watch(event, outcome)
+
+        now = datetime.utcnow()
+        for i, outcome in enumerate(event.outcomes):
+            market = tracker.get_watched_markets()[outcome.token_id]
+            # Only 2 of 5 move significantly
+            if i < 2:
+                prices = [0.20, 0.25]  # +5c
+            else:
+                prices = [0.20, 0.205]  # +0.5c (below 2c threshold)
+            history = deque([
+                PriceSnapshot(timestamp=now - timedelta(hours=1), mid_price=prices[0], source="websocket"),
+                PriceSnapshot(timestamp=now, mid_price=prices[1], source="websocket"),
+            ])
+            inject_history(market, history)
+
+        alerts = detector.check_correlated_markets(tracker)
+        assert len(alerts) == 0
+
+    def test_mixed_directions_no_alert(self):
+        """3 outcomes moving up but 3 down does not trigger if neither group hits min."""
+        config = make_config()
+        tracker = PriceTracker(config)
+        detector = AnomalyDetector(config)
+
+        event = self._make_multi_outcome_event(n_outcomes=4)
+        for outcome in event.outcomes:
+            tracker.add_watch(event, outcome)
+
+        now = datetime.utcnow()
+        # 2 up, 2 down — neither group >= 3
+        directions = [+0.04, +0.03, -0.04, -0.03]
+        for i, outcome in enumerate(event.outcomes):
+            market = tracker.get_watched_markets()[outcome.token_id]
+            history = deque([
+                PriceSnapshot(timestamp=now - timedelta(hours=1), mid_price=0.30, source="websocket"),
+                PriceSnapshot(timestamp=now, mid_price=0.30 + directions[i], source="websocket"),
+            ])
+            inject_history(market, history)
+
+        alerts = detector.check_correlated_markets(tracker)
+        assert len(alerts) == 0
+
+    def test_correlated_excludes_already_alerted(self):
+        """Tokens in exclude_tokens are skipped."""
+        config = make_config()
+        tracker = PriceTracker(config)
+        detector = AnomalyDetector(config)
+
+        event = self._make_multi_outcome_event(n_outcomes=4)
+        for outcome in event.outcomes:
+            tracker.add_watch(event, outcome)
+
+        now = datetime.utcnow()
+        for outcome in event.outcomes:
+            market = tracker.get_watched_markets()[outcome.token_id]
+            history = deque([
+                PriceSnapshot(timestamp=now - timedelta(hours=1), mid_price=0.20, source="websocket"),
+                PriceSnapshot(timestamp=now, mid_price=0.25, source="websocket"),
+            ])
+            inject_history(market, history)
+
+        # Exclude 2 tokens — only 2 remain, below min_correlated=3
+        exclude = {event.outcomes[0].token_id, event.outcomes[1].token_id}
+        alerts = detector.check_correlated_markets(tracker, exclude_tokens=exclude)
+        assert len(alerts) == 0
+
+    def test_correlation_bonus_increases_score(self):
+        """More correlated outcomes = higher suspicion score via bonus."""
+        config = make_config()
+        tracker = PriceTracker(config)
+
+        now = datetime.utcnow()
+
+        # Test with 3 outcomes (minimum)
+        detector3 = AnomalyDetector(config)
+        event3 = self._make_multi_outcome_event(event_id="e3", n_outcomes=3)
+        for outcome in event3.outcomes:
+            tracker.add_watch(event3, outcome)
+            market = tracker.get_watched_markets()[outcome.token_id]
+            history = deque([
+                PriceSnapshot(timestamp=now - timedelta(hours=1), mid_price=0.20, source="websocket"),
+                PriceSnapshot(timestamp=now, mid_price=0.25, source="websocket"),
+            ])
+            inject_history(market, history)
+        alerts3 = detector3.check_correlated_markets(tracker)
+
+        # Test with 6 outcomes (larger group) — use separate tracker to isolate
+        tracker6 = PriceTracker(config)
+        detector6 = AnomalyDetector(config)
+        event6 = self._make_multi_outcome_event(event_id="e6", n_outcomes=6)
+        for outcome in event6.outcomes:
+            tracker6.add_watch(event6, outcome)
+            market = tracker6.get_watched_markets()[outcome.token_id]
+            history = deque([
+                PriceSnapshot(timestamp=now - timedelta(hours=1), mid_price=0.20, source="websocket"),
+                PriceSnapshot(timestamp=now, mid_price=0.25, source="websocket"),
+            ])
+            inject_history(market, history)
+        alerts6 = detector6.check_correlated_markets(tracker6)
+
+        assert len(alerts3) == 1 and len(alerts6) == 1
+        # 6-outcome correlation should score higher than 3-outcome
+        assert alerts6[0].suspicion_score > alerts3[0].suspicion_score
+
+
+# ──────────────────────────────────────────────────────────────
+# Baseline Floor Filtering Tests
+# ──────────────────────────────────────────────────────────────
+
+class TestBaselineFloorFiltering:
+    """Tests that dead-market baselines (sub-3c) are filtered out."""
+
+    def test_dead_market_wakeup_filtered(self):
+        """A move from 0.1c to 50c (esports resolution) should produce no alert."""
+        config = make_config()
+        detector = AnomalyDetector(config)
+        tracker = PriceTracker(config)
+
+        event = make_event()
+        outcome = event.outcomes[0]
+        tracker.add_watch(event, outcome)
+
+        now = datetime.utcnow()
+        market = tracker.get_watched_markets()[outcome.token_id]
+        history = deque([
+            PriceSnapshot(timestamp=now - timedelta(hours=2), mid_price=0.001, source="websocket"),
+            PriceSnapshot(timestamp=now, mid_price=0.50, source="websocket"),
+        ])
+        inject_history(market, history)
+
+        alert = detector.check_market(outcome.token_id, tracker)
+        assert alert is None
+
+    def test_legitimate_low_price_not_filtered(self):
+        """A move from 7c to 20c (above floor) should still produce an alert."""
+        config = make_config()
+        detector = AnomalyDetector(config)
+        tracker = PriceTracker(config)
+
+        event = make_event()
+        outcome = event.outcomes[0]
+        tracker.add_watch(event, outcome)
+
+        now = datetime.utcnow()
+        market = tracker.get_watched_markets()[outcome.token_id]
+        history = deque([
+            PriceSnapshot(timestamp=now - timedelta(minutes=20), mid_price=0.07, source="websocket"),
+            PriceSnapshot(timestamp=now, mid_price=0.20, source="websocket"),
+        ])
+        inject_history(market, history)
+
+        alert = detector.check_market(outcome.token_id, tracker)
+        # 7c->20c = +186%, breaches 50%/1h relative threshold
+        assert alert is not None
+        assert alert.price_before == pytest.approx(0.07)
+        assert alert.price_after == pytest.approx(0.20)
+
+    def test_dead_market_filtered_in_correlation(self):
+        """Sub-floor baselines should be excluded from correlated mover counts."""
+        config = make_config()
+        detector = AnomalyDetector(config)
+        tracker = PriceTracker(config)
+
+        now = datetime.utcnow()
+
+        # 5 outcomes all moving from 0.001 to 0.50 (dead market wakeup)
+        outcomes = []
+        for i in range(5):
+            outcomes.append(Outcome(
+                outcome_id=f"o_{i}", market_id=f"m_{i}", condition_id=f"c_{i}",
+                token_id=f"token_dead_{i}", name=f"Outcome {i}",
+                status=OutcomeStatus.ACTIVE,
+                bba=OutcomeBBA(best_bid=0.001, best_ask=0.50),
+            ))
+        event = make_event(event_id="dead_event", outcomes=outcomes)
+
+        for outcome in outcomes:
+            tracker.add_watch(event, outcome)
+            market = tracker.get_watched_markets()[outcome.token_id]
+            history = deque([
+                PriceSnapshot(timestamp=now - timedelta(hours=1), mid_price=0.001, source="websocket"),
+                PriceSnapshot(timestamp=now, mid_price=0.50, source="websocket"),
+            ])
+            inject_history(market, history)
+
+        alerts = detector.check_correlated_markets(tracker)
+        assert len(alerts) == 0
+
+    def test_absolute_threshold_respects_floor(self):
+        """Absolute threshold check also skips sub-floor baselines."""
+        config = make_config()
+        detector = AnomalyDetector(config)
+        tracker = PriceTracker(config)
+
+        event = make_event()
+        outcome = event.outcomes[0]
+        tracker.add_watch(event, outcome)
+
+        now = datetime.utcnow()
+        market = tracker.get_watched_markets()[outcome.token_id]
+        # 0.02 -> 0.15 = 13c move (breaches 10c/1h absolute threshold)
+        # but baseline is below 3c floor
+        history = deque([
+            PriceSnapshot(timestamp=now - timedelta(minutes=30), mid_price=0.02, source="websocket"),
+            PriceSnapshot(timestamp=now, mid_price=0.15, source="websocket"),
+        ])
+        inject_history(market, history)
+
+        alert = detector.check_market(outcome.token_id, tracker)
+        assert alert is None
+
+
+# ──────────────────────────────────────────────────────────────
+# Correlation Re-alert Suppression Tests
+# ──────────────────────────────────────────────────────────────
+
+class TestCorrelationRealertSuppression(TestCorrelatedMarkets):
+    """Tests that correlated alerts don't re-fire when price hasn't moved."""
+
+    def test_correlated_suppressed_on_second_scan(self):
+        """Same correlated pattern should not fire twice if prices haven't moved."""
+        config = make_config(alert_cooldown_seconds=0)  # No time cooldown
+        detector = AnomalyDetector(config)
+        tracker = PriceTracker(config)
+
+        now = datetime.utcnow()
+        event = self._make_multi_outcome_event(event_id="esport1", n_outcomes=4)
+
+        for outcome in event.outcomes:
+            tracker.add_watch(event, outcome)
+            market = tracker.get_watched_markets()[outcome.token_id]
+            history = deque([
+                PriceSnapshot(timestamp=now - timedelta(hours=1), mid_price=0.20, source="websocket"),
+                PriceSnapshot(timestamp=now, mid_price=0.25, source="websocket"),
+            ])
+            inject_history(market, history)
+
+        # First scan: should fire
+        alerts1 = detector.check_correlated_markets(tracker)
+        assert len(alerts1) == 1
+
+        # Second scan: same prices, should be suppressed
+        alerts2 = detector.check_correlated_markets(tracker)
+        assert len(alerts2) == 0
+
+    def test_correlated_refires_on_new_movement(self):
+        """Correlated alert should re-fire if prices move further (>2c)."""
+        config = make_config(alert_cooldown_seconds=0)
+        detector = AnomalyDetector(config)
+        tracker = PriceTracker(config)
+
+        now = datetime.utcnow()
+        event = self._make_multi_outcome_event(event_id="geo1", n_outcomes=4)
+
+        for outcome in event.outcomes:
+            tracker.add_watch(event, outcome)
+            market = tracker.get_watched_markets()[outcome.token_id]
+            history = deque([
+                PriceSnapshot(timestamp=now - timedelta(hours=1), mid_price=0.20, source="websocket"),
+                PriceSnapshot(timestamp=now, mid_price=0.25, source="websocket"),
+            ])
+            inject_history(market, history)
+
+        # First scan: fires
+        alerts1 = detector.check_correlated_markets(tracker)
+        assert len(alerts1) == 1
+
+        # Prices move further (+5c beyond alerted level)
+        for outcome in event.outcomes:
+            market = tracker.get_watched_markets()[outcome.token_id]
+            market.live_history.append(
+                PriceSnapshot(timestamp=now + timedelta(minutes=5), mid_price=0.31, source="websocket")
+            )
+            market.history.append(
+                PriceSnapshot(timestamp=now + timedelta(minutes=5), mid_price=0.31, source="websocket")
+            )
+
+        # Second scan: should re-fire because price moved >5c (reversion threshold)
+        alerts2 = detector.check_correlated_markets(tracker)
+        assert len(alerts2) == 1
+
+
+# ──────────────────────────────────────────────────────────────
+# Live Sports/Esports Filtering Tests
+# ──────────────────────────────────────────────────────────────
+
+class TestLiveEventFiltering:
+    """Tests that live sports/esports events are filtered from alerts."""
+
+    def test_esports_slug_filtered(self):
+        """CS2 esports match should not produce alerts."""
+        config = make_config()
+        detector = AnomalyDetector(config)
+        tracker = PriceTracker(config)
+
+        event = make_event(
+            event_id="cs2match",
+            title="Counter-Strike: Monte vs Passion UA (BO3)",
+            slug="cs2-monte-passion-2026-03-31",
+        )
+        outcome = event.outcomes[0]
+        tracker.add_watch(event, outcome)
+
+        now = datetime.utcnow()
+        market = tracker.get_watched_markets()[outcome.token_id]
+        history = deque([
+            PriceSnapshot(timestamp=now - timedelta(minutes=20), mid_price=0.50, source="websocket"),
+            PriceSnapshot(timestamp=now, mid_price=0.99, source="websocket"),
+        ])
+        inject_history(market, history)
+
+        alert = detector.check_market(outcome.token_id, tracker)
+        assert alert is None
+
+    def test_lol_slug_filtered(self):
+        """League of Legends match should not produce alerts."""
+        config = make_config()
+        detector = AnomalyDetector(config)
+        tracker = PriceTracker(config)
+
+        event = make_event(
+            event_id="lolmatch",
+            title="LoL: JD Gaming vs Oh My God (BO3)",
+            slug="lol-jdg-omg-2026-03-31",
+        )
+        outcome = event.outcomes[0]
+        tracker.add_watch(event, outcome)
+
+        now = datetime.utcnow()
+        market = tracker.get_watched_markets()[outcome.token_id]
+        history = deque([
+            PriceSnapshot(timestamp=now - timedelta(minutes=20), mid_price=0.30, source="websocket"),
+            PriceSnapshot(timestamp=now, mid_price=0.80, source="websocket"),
+        ])
+        inject_history(market, history)
+
+        alert = detector.check_market(outcome.token_id, tracker)
+        assert alert is None
+
+    def test_nba_live_match_filtered(self):
+        """Live NBA match should not produce alerts."""
+        config = make_config()
+        detector = AnomalyDetector(config)
+        tracker = PriceTracker(config)
+
+        event = make_event(
+            event_id="nbagame",
+            title="Cavaliers vs. Lakers",
+            slug="nba-cle-lal-2026-03-31",
+        )
+        outcome = event.outcomes[0]
+        tracker.add_watch(event, outcome)
+
+        now = datetime.utcnow()
+        market = tracker.get_watched_markets()[outcome.token_id]
+        history = deque([
+            PriceSnapshot(timestamp=now - timedelta(minutes=20), mid_price=0.40, source="websocket"),
+            PriceSnapshot(timestamp=now, mid_price=0.85, source="websocket"),
+        ])
+        inject_history(market, history)
+
+        alert = detector.check_market(outcome.token_id, tracker)
+        assert alert is None
+
+    def test_geopolitical_not_filtered(self):
+        """Iran ceasefire market should NOT be filtered."""
+        config = make_config()
+        detector = AnomalyDetector(config)
+        tracker = PriceTracker(config)
+
+        event = make_event(
+            event_id="ceasefire",
+            title="US x Iran ceasefire by...?",
+            slug="us-x-iran-ceasefire-by",
+        )
+        outcome = event.outcomes[0]
+        tracker.add_watch(event, outcome)
+
+        now = datetime.utcnow()
+        market = tracker.get_watched_markets()[outcome.token_id]
+        history = deque([
+            PriceSnapshot(timestamp=now - timedelta(minutes=20), mid_price=0.07, source="websocket"),
+            PriceSnapshot(timestamp=now, mid_price=0.20, source="websocket"),
+        ])
+        inject_history(market, history)
+
+        alert = detector.check_market(outcome.token_id, tracker)
+        assert alert is not None
+
+    def test_season_long_sports_not_filtered(self):
+        """Season-long NBA Champion market should NOT be filtered."""
+        config = make_config()
+        detector = AnomalyDetector(config)
+        tracker = PriceTracker(config)
+
+        event = make_event(
+            event_id="nbachamp",
+            title="2026 NBA Champion",
+            slug="2026-nba-champion",
+        )
+        outcome = event.outcomes[0]
+        tracker.add_watch(event, outcome)
+
+        now = datetime.utcnow()
+        market = tracker.get_watched_markets()[outcome.token_id]
+        history = deque([
+            PriceSnapshot(timestamp=now - timedelta(minutes=20), mid_price=0.10, source="websocket"),
+            PriceSnapshot(timestamp=now, mid_price=0.25, source="websocket"),
+        ])
+        inject_history(market, history)
+
+        alert = detector.check_market(outcome.token_id, tracker)
+        assert alert is not None
+
+    def test_esports_filtered_from_correlation(self):
+        """Esports outcomes should not count toward correlated alerts."""
+        config = make_config()
+        detector = AnomalyDetector(config)
+        tracker = PriceTracker(config)
+
+        now = datetime.utcnow()
+
+        # 5 esports outcomes all moving together
+        outcomes = []
+        for i in range(5):
+            outcomes.append(Outcome(
+                outcome_id=f"o_{i}", market_id=f"m_{i}", condition_id=f"c_{i}",
+                token_id=f"token_cs_{i}", name=f"Outcome {i}",
+                status=OutcomeStatus.ACTIVE,
+                bba=OutcomeBBA(best_bid=0.20, best_ask=0.25),
+            ))
+        event = make_event(
+            event_id="cs2corr",
+            title="CS: Monte vs Passion",
+            slug="cs2-monte-passion-2026-03-31",
+            outcomes=outcomes,
+        )
+
+        for outcome in outcomes:
+            tracker.add_watch(event, outcome)
+            market = tracker.get_watched_markets()[outcome.token_id]
+            history = deque([
+                PriceSnapshot(timestamp=now - timedelta(hours=1), mid_price=0.20, source="websocket"),
+                PriceSnapshot(timestamp=now, mid_price=0.25, source="websocket"),
+            ])
+            inject_history(market, history)
+
+        alerts = detector.check_correlated_markets(tracker)
+        assert len(alerts) == 0
+
+    def test_is_live_event_helper(self):
+        """Direct test of _is_live_event helper."""
+        config = make_config()
+        detector = AnomalyDetector(config)
+
+        assert detector._is_live_event("cs2-monte-passion-2026-03-31") is True
+        assert detector._is_live_event("lol-jdg-omg-2026-03-31") is True
+        assert detector._is_live_event("nba-cle-lal-2026-03-31") is True
+        assert detector._is_live_event("nhl-sea-edm-2026-03-31") is True
+        assert detector._is_live_event("wta-volynet-shnaide-2026-03-31") is True
+        assert detector._is_live_event("atp-etcheve-gomez-2026-03-31") is True
+        assert detector._is_live_event("blast-open-rotterdam-2026") is True
+
+        assert detector._is_live_event("us-x-iran-ceasefire-by") is False
+        assert detector._is_live_event("2026-nba-champion") is False
+        assert detector._is_live_event("2026-fifa-world-cup-winner-595") is False
+        assert detector._is_live_event("iran-leadership-change-by") is False
+        assert detector._is_live_event("") is False
