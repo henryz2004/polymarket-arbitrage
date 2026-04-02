@@ -103,6 +103,17 @@ class NegriskEngine:
 
         logger.info(f"NegriskEngine initialized (platform={platform}, scan_only={scan_only})")
 
+    @property
+    def _prefilter_threshold(self) -> float:
+        """
+        Dynamic pre-filter threshold based on config.
+
+        Uses min_net_edge * 3 with a floor of 0.02 (2%).
+        This avoids scanning events that are 10x further from opportunity
+        than our minimum edge requirement (the old hardcoded 0.05 was too wide).
+        """
+        return max(self.config.min_net_edge * 3, 0.02)
+
     async def start(self) -> None:
         """Start the neg-risk arbitrage engine."""
         if self._running:
@@ -194,8 +205,7 @@ class NegriskEngine:
             return
 
         # Fast pre-filter: skip events that are far from any opportunity
-        # threshold=0.05 means we only scan if sum_asks < 1.05 or sum_bids > 0.95
-        if not self.registry.is_near_opportunity(event_id, threshold=0.05):
+        if not self.registry.is_near_opportunity(event_id, threshold=self._prefilter_threshold):
             self.detector.stats.prefilter_callbacks_skipped += 1
             return
 
@@ -305,7 +315,7 @@ class NegriskEngine:
         while self._running:
             try:
                 # Pre-filter once, then reuse for both scan and interval decision
-                near_events = self.registry.get_near_opportunity_events(threshold=0.05)
+                near_events = self.registry.get_near_opportunity_events(threshold=self._prefilter_threshold)
                 await self._scan_for_opportunities(near_events)
 
                 # Adaptive interval based on pre-filter results (no extra iteration)
@@ -399,7 +409,7 @@ class NegriskEngine:
                 If None, performs its own pre-filtering.
         """
         events = prefiltered_events if prefiltered_events is not None else \
-            self.registry.get_near_opportunity_events(threshold=0.05)
+            self.registry.get_near_opportunity_events(threshold=self._prefilter_threshold)
 
         # Track pre-filter effectiveness
         total_events = len(self.registry.get_event_ids())

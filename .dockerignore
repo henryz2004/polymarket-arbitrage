@@ -1,0 +1,49 @@
+# Virtual environment
+venv/
+.venv/
+
+# Logs (will be mounted as volume)
+logs/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Claude/AI
+.claude/
+CLAUDE.md
+
+# Media/docs (not needed in container)
+*.mp4
+*.png
+*.md
+!requirements.txt
+
+# Test files (not needed in prod)
+tests/
+test_*.py
+*_test.py
+
+# Shell scripts (local only)
+*.sh
+
+# Worktrees
+worktrees/
+
+# Environment files (secrets should be env vars, not files)
+.env
+.env.*

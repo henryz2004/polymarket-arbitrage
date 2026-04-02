@@ -39,13 +39,17 @@ class PolymarketFeeModel:
         Compute total taker fee per share across all legs.
 
         Uses the Polymarket CTF Exchange formula (CalculatorHelper.sol).
-        fee_rate_bps_override is accepted for interface compat but ignored —
-        Polymarket fee rates are set per-market in config, not per-event.
+
+        fee_rate_bps_override: Per-event fee rate (e.g. crypto neg-risk markets
+        at 1000 bps). If provided and > 0, overrides the instance default.
+        This matters for fee-enabled Polymarket markets — ignoring it would
+        show inflated edges and cause real money loss on execution.
         """
-        if self._fee_rate_bps == 0:
+        rate = fee_rate_bps_override if fee_rate_bps_override and fee_rate_bps_override > 0 else self._fee_rate_bps
+        if rate == 0:
             return 0.0
 
-        base_rate = self._fee_rate_bps / 10000.0
+        base_rate = rate / 10000.0
         total_fee = 0.0
 
         for p in prices:

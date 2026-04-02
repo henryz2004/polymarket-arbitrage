@@ -168,6 +168,7 @@ class BBATracker:
             close_timeout=5,
         ) as ws:
             # Reset reconnect delay on successful connection
+            was_disconnected = not self.ws_connected
             self.ws_connected = True
             logger.info("WebSocket connected")
 
@@ -178,6 +179,15 @@ class BBATracker:
             }
             await ws.send(json.dumps(subscribe_msg))
             logger.info(f"Subscribed to {len(token_ids)} tokens")
+
+            # Post-reconnect: re-seed CLOB data for near-opportunity events
+            # After a disconnect, BBA data becomes stale. Re-seeding ensures
+            # we have fresh prices before the next detection scan.
+            if was_disconnected:
+                asyncio.create_task(
+                    self._post_reconnect_reseed(),
+                    name="post_reconnect_reseed",
+                )
 
             # Process messages
             async for message in ws:
@@ -527,6 +537,51 @@ class BBATracker:
                     continue
         finally:
             self.on_price_update = original_callback
+
+    async def _post_reconnect_reseed(self) -> None:
+        """
+        Re-seed CLOB data after WebSocket reconnection.
+
+        After a disconnect, BBA timestamps are stale. Re-seed
+        near-opportunity events first (highest priority), then
+        remaining high-volume events in batches.
+        """
+        try:
+            # Small delay to let WS messages start flowing
+            await asyncio.sleep(1.0)
+
+            # Priority 1: re-seed events near opportunity threshold
+            near_events = self.registry.get_near_opportunity_events(threshold=0.05)
+            if near_events:
+                logger.info(f"Post-reconnect: re-seeding {len(near_events)} near-opportunity events")
+                for event in near_events:
+                    try:
+                        await self.fetch_all_prices(event)
+                    except Exception as e:
+                        logger.debug(f"Post-reconnect reseed error for {event.event_id}: {e}")
+                    await asyncio.sleep(0.2)  # Rate limit
+
+            # Priority 2: re-seed top-volume events (up to 50)
+            all_events = self.registry.get_tradeable_events()
+            near_ids = {e.event_id for e in near_events} if near_events else set()
+            remaining = [e for e in all_events if e.event_id not in near_ids]
+            remaining.sort(key=lambda e: e.volume_24h, reverse=True)
+
+            batch = remaining[:50]
+            if batch:
+                logger.info(f"Post-reconnect: re-seeding {len(batch)} high-volume events")
+                for event in batch:
+                    try:
+                        await self.fetch_all_prices(event)
+                    except Exception as e:
+                        logger.debug(f"Post-reconnect reseed error for {event.event_id}: {e}")
+                    await asyncio.sleep(0.3)
+
+            total = len(near_events or []) + len(batch)
+            logger.info(f"Post-reconnect re-seed complete: {total} events refreshed")
+
+        except Exception as e:
+            logger.error(f"Post-reconnect reseed failed: {e}")
 
     def get_stats(self) -> dict:
         """Get tracker statistics."""

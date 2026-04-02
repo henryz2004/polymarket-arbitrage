@@ -24,12 +24,12 @@ import argparse
 import asyncio
 import json
 import logging
-import subprocess
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
+from core.negrisk.alerter import NegriskAlerter
 from core.negrisk.models import NegriskConfig, NegriskOpportunity
 from core.negrisk.recorder import BBARecorder
 from core.negrisk.registry import NegriskRegistry
@@ -87,6 +87,7 @@ class NegriskLongTest:
         self._limitless_executor = None
         self._polymarket_executor = None
         self._recorder: Optional[BBARecorder] = None
+        self._alerter = NegriskAlerter(enable_sound=True)
         self.start_time = datetime.now()
         self.end_time = self.start_time + self.duration
 
@@ -380,6 +381,9 @@ class NegriskLongTest:
         if hasattr(self, '_limitless_api_client') and self._limitless_api_client:
             await self._limitless_api_client.stop()
 
+        # Cleanup alerter
+        await self._alerter.close()
+
         self.logger.info("Test stopped")
         self._log_final_summary()
 
@@ -466,10 +470,17 @@ class NegriskLongTest:
         """
         Callback for price updates — triggers immediate event-driven scanning.
 
-        Matches NegriskEngine's approach: scan the specific event that updated
-        instead of waiting for the periodic poll.
+        Matches NegriskEngine's approach: pre-filter then scan the specific
+        event that updated instead of waiting for the periodic poll.
         """
         if not self.registry or not self.detector:
+            return
+
+        # Pre-filter: skip events that are far from any opportunity
+        # This prevents 94K+ WS messages from each triggering full detection
+        # (which was the main source of stale rejection inflation)
+        prefilter_threshold = max(self.min_net_edge * 3, 0.02)
+        if not self.registry.is_near_opportunity(event_id, threshold=prefilter_threshold):
             return
 
         event = self.registry.get_event(event_id)
@@ -535,8 +546,11 @@ class NegriskLongTest:
                 if not self.registry or not self.detector:
                     continue
 
-                # Scan for opportunities
-                events = self.registry.get_tradeable_events()
+                # Pre-filter: only scan events near opportunity threshold
+                # This matches NegriskEngine's approach and prevents stale
+                # rejection inflation from checking 300+ events every 2s
+                prefilter_threshold = max(self.min_net_edge * 3, 0.02)
+                events = self.registry.get_near_opportunity_events(threshold=prefilter_threshold)
                 self.total_scans += 1
 
                 if not events:
@@ -561,15 +575,17 @@ class NegriskLongTest:
                 # Log scan stats every 100 scans (~3 min at 2s interval)
                 if self.total_scans % 100 == 0:
                     det_stats = self.detector.get_stats_dict()
-                    self.logger.info(f"Scan #{self.total_scans}: {len(events)} events checked, "
+                    total_events = len(self.registry.get_event_ids()) if self.registry else 0
+                    self.logger.info(f"Scan #{self.total_scans}: {len(events)}/{total_events} events checked (pre-filtered), "
                                    f"{self.total_opportunities} total opportunities found, "
                                    f"edge_rejects={det_stats['edge_too_low_rejections']}, "
+                                   f"stale_rejects={det_stats['stale_data_rejections']}, "
                                    f"liq_rejects={det_stats['liquidity_rejections']}")
 
-                    # Log top candidates by gross edge (sanity check)
+                    # Log top candidates by closeness to opportunity
                     candidates = self.detector.get_last_scan_candidates()
                     if candidates:
-                        self.logger.info("Top candidates this scan (by gross edge):")
+                        self.logger.info("Top candidates (closest to opportunity):")
                         for c in candidates[:10]:
                             direction = c.get('direction', 'BUY')
                             self.logger.info(
@@ -578,6 +594,20 @@ class NegriskLongTest:
                                 f"gross={c['gross_edge']:.4f} ({c['gross_edge']*100:.2f}%) | "
                                 f"fee={c['fee']:.4f} | gas/sh={c['gas_per_share']:.6f} | "
                                 f"net={c['net_edge']:.4f} ({c['net_edge']*100:.2f}%)"
+                            )
+
+                    # Log near-miss candidates (rejected at coverage/staleness)
+                    near_misses = self.detector.get_last_scan_near_misses()
+                    if near_misses:
+                        self.logger.info("Near-miss candidates (coverage/staleness rejected):")
+                        for nm in near_misses[:5]:
+                            self.logger.info(
+                                f"  [{nm['direction']}] {nm['title']} | "
+                                f"legs={nm['covered']}/{nm['legs']} (missing {nm['missing']}) | "
+                                f"partial_sum={nm['partial_sum']:.4f} | "
+                                f"est_sum={nm['estimated_sum']:.4f} | "
+                                f"est_edge={nm['gross_edge']:.4f} ({nm['gross_edge']*100:.2f}%) | "
+                                f"reason={nm['rejection']}"
                             )
 
             except asyncio.CancelledError:
@@ -597,26 +627,9 @@ class NegriskLongTest:
             except Exception as e:
                 self.logger.error(f"Stats error: {e}")
 
-    def _trigger_mac_alert(self, opp: NegriskOpportunity):
-        """Fire a Mac audio alert for a detected opportunity."""
-        try:
-            # Play system alert sound (non-blocking)
-            subprocess.Popen(
-                ["afplay", "/System/Library/Sounds/Purr.aiff"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            # Speak alert with platform name and edge
-            platform = opp.event.platform or "market"
-            edge_pct = opp.net_edge * 100
-            msg = f"{platform} alert. {edge_pct:.0f} percent edge detected."
-            subprocess.Popen(
-                ["say", msg],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception as e:
-            self.logger.debug(f"Mac alert failed: {e}")
+    def _fire_alert(self, opp: NegriskOpportunity):
+        """Fire alerts for a detected opportunity (webhook + sound)."""
+        asyncio.create_task(self._alerter.send_opportunity_alert(opp))
 
     def _log_opportunity(self, opp: NegriskOpportunity):
         """Log an opportunity with full details and trigger Mac audio alert."""
@@ -629,8 +642,8 @@ class NegriskLongTest:
         else:
             market_url = f"https://polymarket.com/event/{opp.event.slug}"
 
-        # Trigger Mac audio alert
-        self._trigger_mac_alert(opp)
+        # Trigger alerts (webhook + sound)
+        self._fire_alert(opp)
 
         self.logger.info("=" * 80)
         self.logger.info(f"OPPORTUNITY DETECTED [{direction}]: {opp.opportunity_id}")

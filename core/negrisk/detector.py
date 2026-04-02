@@ -117,8 +117,10 @@ class NegriskDetector:
         self._recent_opportunities: dict[str, NegriskOpportunity] = {}
         self._opportunity_cooldown: dict[str, datetime] = {}
 
-        # Diagnostics: top candidates from last scan
+        # Diagnostics: top candidates from last scan (passed all pre-edge filters)
         self._last_scan_candidates: list[dict] = []
+        # Diagnostics: near-miss candidates (rejected at coverage/staleness but close to opportunity)
+        self._last_scan_near_misses: list[dict] = []
 
         # Diagnostic: throttle LIQ_REJECT logs (one per event per 60s)
         self._liq_reject_log_cooldown: dict[str, datetime] = {}
@@ -137,6 +139,7 @@ class NegriskDetector:
         opportunities = []
         # Track best candidates this scan for diagnostics
         self._last_scan_candidates: list[dict] = []
+        self._last_scan_near_misses: list[dict] = []
 
         for event in events:
             if strategy == "maker":
@@ -153,9 +156,15 @@ class NegriskDetector:
             if sell_opp:
                 opportunities.append(sell_opp)
 
-        # Sort candidates by gross_edge descending, keep top 10
-        self._last_scan_candidates.sort(key=lambda c: c["gross_edge"], reverse=True)
+        # Sort candidates by abs(gross_edge) ascending — closest to opportunity first
+        # This fixes the issue where buy-side (-3%) and sell-side (-93%) were
+        # mixed together and sell-side dominated the diagnostics.
+        self._last_scan_candidates.sort(key=lambda c: abs(c["gross_edge"]))
         self._last_scan_candidates = self._last_scan_candidates[:10]
+
+        # Sort near-misses the same way
+        self._last_scan_near_misses.sort(key=lambda c: abs(c["gross_edge"]))
+        self._last_scan_near_misses = self._last_scan_near_misses[:5]
 
         return opportunities
 
@@ -246,6 +255,25 @@ class NegriskDetector:
                 f"COVERAGE_REJECT: {event.title[:60]} | "
                 f"tradeable={len(tradeable)}/{len(active)} (missing {missing} legs)"
             )
+            # Near-miss diagnostic: compute partial sum from available asks
+            # to show how close this event is to a real opportunity
+            available_asks = [o.bba.best_ask for o in tradeable if o.bba.best_ask is not None]
+            if available_asks:
+                partial_sum = sum(available_asks)
+                # Estimate: missing legs at worst are each ~1/(total outcomes)
+                estimated_sum = partial_sum + missing * (partial_sum / max(len(available_asks), 1))
+                estimated_edge = 1.0 - estimated_sum
+                self._last_scan_near_misses.append({
+                    "title": event.title[:60],
+                    "direction": "BUY",
+                    "legs": len(active),
+                    "covered": len(tradeable),
+                    "missing": missing,
+                    "partial_sum": round(partial_sum, 4),
+                    "estimated_sum": round(estimated_sum, 4),
+                    "gross_edge": round(estimated_edge, 4),
+                    "rejection": "coverage",
+                })
             return None
 
         # Check for stale data (only for CLOB-backed outcomes)
@@ -491,8 +519,9 @@ class NegriskDetector:
             self.stats.incomplete_coverage_rejections += 1
             return None
 
-        # Check for stale data
-        if event.has_stale_data(self.config.staleness_ttl_ms):
+        # Check for stale data (category-adaptive TTL)
+        effective_ttl = event.get_effective_staleness_ttl(self.config)
+        if event.has_stale_data(effective_ttl):
             self.stats.stale_data_rejections += 1
             return None
 
@@ -674,7 +703,7 @@ class NegriskDetector:
         effective_ttl = event.get_effective_staleness_ttl(self.config)
         clob_outcomes = [o for o in tradeable if o not in gamma_legs]
         if any(o.bba.is_stale(effective_ttl) for o in clob_outcomes):
-            # Already counted in buy-side, don't double-count
+            self.stats.stale_data_rejections_sell += 1
             return None
 
         # Calculate sum of bids from tradeable outcomes
@@ -899,9 +928,10 @@ class NegriskDetector:
             self.stats.incomplete_coverage_rejections += 1
             return None
 
-        # Check for stale data
-        if event.has_stale_data(self.config.staleness_ttl_ms):
-            # Already counted in buy-side, don't double-count
+        # Check for stale data (category-adaptive TTL)
+        effective_ttl = event.get_effective_staleness_ttl(self.config)
+        if event.has_stale_data(effective_ttl):
+            self.stats.stale_data_rejections_sell += 1
             return None
 
         # Calculate maker prices at mid-price with optional offset
@@ -1052,8 +1082,8 @@ class NegriskDetector:
         event = opportunity.event
         is_sell = opportunity.direction == ArbDirection.SELL_ALL
 
-        # Stale check
-        if event.has_stale_data(self.config.staleness_ttl_ms):
+        # Stale check (use category-adaptive TTL to match detection logic)
+        if event.has_stale_data_adaptive(self.config):
             logger.warning(f"Opportunity {opportunity.opportunity_id} rejected: stale data")
             return False
 
@@ -1124,8 +1154,12 @@ class NegriskDetector:
             self.stats.total_volume += opp.total_cost
 
     def get_last_scan_candidates(self) -> list[dict]:
-        """Get top candidates from the last scan (sorted by gross_edge desc)."""
+        """Get top candidates from the last scan (sorted by abs(gross_edge) ascending — closest to opportunity first)."""
         return getattr(self, '_last_scan_candidates', [])
+
+    def get_last_scan_near_misses(self) -> list[dict]:
+        """Get near-miss candidates rejected at coverage/staleness (sorted by abs(gross_edge) ascending)."""
+        return getattr(self, '_last_scan_near_misses', [])
 
     def get_stats(self) -> NegriskStats:
         """Get detector statistics."""
@@ -1140,6 +1174,7 @@ class NegriskDetector:
             "total_profit": round(self.stats.total_profit, 2),
             "total_volume": round(self.stats.total_volume, 2),
             "stale_data_rejections": self.stats.stale_data_rejections,
+            "stale_data_rejections_sell": self.stats.stale_data_rejections_sell,
             "incomplete_coverage_rejections": self.stats.incomplete_coverage_rejections,
             "liquidity_rejections": self.stats.liquidity_rejections,
             "edge_too_low_rejections": self.stats.edge_too_low_rejections,

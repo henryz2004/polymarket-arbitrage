@@ -27,6 +27,7 @@ Pre-flight:
   5. Kill switch: touch KILL_SWITCH to immediately halt all execution
 """
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
@@ -255,12 +256,21 @@ class PolymarketExecutor:
             f"({opportunity.net_edge * 100:.2f}%)"
         )
 
-        # Step 1: Pre-flight slippage check on all legs
-        for leg in opportunity.legs:
-            slippage_ok = await self._check_leg_slippage(leg)
+        # Step 1: Pre-flight slippage check on all legs (parallel for lower latency)
+        slippage_tasks = [self._check_leg_slippage(leg) for leg in opportunity.legs]
+        slippage_results = await asyncio.gather(*slippage_tasks, return_exceptions=True)
+
+        for i, result in enumerate(slippage_results):
+            if isinstance(result, Exception):
+                logger.warning(f"Slippage check exception for leg {i}: {result}")
+                slippage_ok = False
+            else:
+                slippage_ok = result
+
             if not slippage_ok:
                 self._stats["slippage_rejections"] += 1
                 elapsed = (time.monotonic() - start_time) * 1000
+                leg = opportunity.legs[i]
                 return ExecutionResult(
                     success=False,
                     reason=(

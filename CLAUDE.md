@@ -284,3 +284,4 @@ resp = client.post_orders(orders)
 - Type hints required (checked by mypy)
 - Format with black
 - Custom log levels: TRADE (25), OPPORTUNITY (26) defined in utils/logging_utils.py
+- you are responsible for re-running the negrisk script after changes.

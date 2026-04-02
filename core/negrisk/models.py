@@ -268,7 +268,6 @@ class NegriskEvent:
     liquidity: float = 0.0
     end_date: Optional[datetime] = None
     created_at: Optional[datetime] = None
-    category: str = ""                       # Event category from Gamma API (lowercase)
 
     # Per-event fee rate (used by Limitless dynamic fees; 0 = use model default)
     fee_rate_bps: float = 0.0
@@ -428,7 +427,8 @@ class NegriskOpportunity:
             return False
         if self.net_edge < config.min_net_edge:
             return False
-        if self.event.has_stale_data(config.staleness_ttl_ms):
+        # Use category-adaptive staleness to match detection logic
+        if self.event.has_stale_data_adaptive(config):
             return False
         return True
 
@@ -468,7 +468,8 @@ class NegriskStats:
     avg_execution_latency_ms: float = 0.0
 
     # Error tracking
-    stale_data_rejections: int = 0
+    stale_data_rejections: int = 0           # Buy-side stale rejections
+    stale_data_rejections_sell: int = 0      # Sell-side stale rejections (tracked separately)
     incomplete_coverage_rejections: int = 0
     liquidity_rejections: int = 0
     edge_too_low_rejections: int = 0

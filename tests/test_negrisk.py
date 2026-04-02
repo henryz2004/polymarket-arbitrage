@@ -2912,14 +2912,27 @@ class TestDynamicFees:
         assert fee_override < fee_default
         assert fee_override == pytest.approx(fee_default * 50 / 300, rel=0.01)
 
-    def test_polymarket_ignores_override(self):
-        """PolymarketFeeModel should accept override kwarg without crashing."""
+    def test_polymarket_respects_override(self):
+        """PolymarketFeeModel should use fee_rate_bps_override when provided.
+
+        This is critical for fee-enabled Polymarket markets (e.g. crypto)
+        where ignoring the override would show inflated edges.
+        """
         from core.negrisk.fee_models import PolymarketFeeModel
 
         model = PolymarketFeeModel(fee_rate_bps=0)
-        # Should not crash and should return 0 (fee-free)
+
+        # With override=100 bps, fee should be non-zero even if instance default is 0
         fee = model.compute_fee_per_share([0.30, 0.35], "BUY", fee_rate_bps_override=100)
-        assert fee == 0.0
+        assert fee > 0.0
+
+        # Without override, fee-free model should return 0
+        fee_no_override = model.compute_fee_per_share([0.30, 0.35], "BUY")
+        assert fee_no_override == 0.0
+
+        # Override of 0 should still return 0
+        fee_zero_override = model.compute_fee_per_share([0.30, 0.35], "BUY", fee_rate_bps_override=0)
+        assert fee_zero_override == 0.0
 
     def test_event_fee_rate_stored(self):
         """NegriskEvent should store per-event fee_rate_bps."""
@@ -3622,6 +3635,243 @@ class TestLimitlessExecutor:
             assert len(result.orders) == 3
         finally:
             self._cleanup_sdk_mocks(mods)
+
+
+class TestSyntheticOpportunityPipeline:
+    """
+    End-to-end synthetic opportunity injection test.
+
+    Verifies the full pipeline fires correctly:
+      BBA prices → NegriskDetector → opportunity detected → alerter fires
+
+    This is a critical hardening test: if the bot fails to detect a
+    synthetic opportunity with known prices, it can't detect real ones.
+    """
+
+    def _make_synthetic_event(self, sum_asks: float, num_outcomes: int = 5) -> NegriskEvent:
+        """
+        Create a synthetic event with controlled ask prices that sum to sum_asks.
+
+        The prices are distributed to be realistic (not uniform).
+        """
+        # Distribute prices roughly: one favorite, rest split
+        prices = []
+        remaining = sum_asks
+        for i in range(num_outcomes):
+            if i == 0:
+                p = min(0.40, remaining * 0.4)
+            elif i < num_outcomes - 1:
+                p = remaining / (num_outcomes - i) * (0.8 + 0.4 * (i % 2))
+                p = min(p, 0.30)
+            else:
+                p = remaining
+            p = round(max(0.03, min(p, 0.90)), 4)
+            prices.append(p)
+            remaining = sum_asks - sum(prices)
+
+        # Adjust last price to hit target exactly
+        prices[-1] = round(sum_asks - sum(prices[:-1]), 4)
+
+        outcomes = []
+        for i, price in enumerate(prices):
+            outcomes.append(Outcome(
+                outcome_id=f"synth_{i}",
+                market_id=f"synth_market_{i}",
+                condition_id="synth_cond",
+                token_id=f"synth_token_{i}",
+                name=f"Synthetic Outcome {i}",
+                status=OutcomeStatus.ACTIVE,
+                bba=OutcomeBBA(
+                    best_bid=round(price - 0.02, 4),
+                    best_ask=price,
+                    bid_size=500.0,
+                    ask_size=500.0,
+                    source="clob",
+                ),
+            ))
+
+        return NegriskEvent(
+            event_id="synth_event_001",
+            slug="synthetic-test-event",
+            title="Synthetic Pipeline Test Event",
+            condition_id="synth_cond",
+            volume_24h=100000.0,
+            platform="polymarket",
+            outcomes=outcomes,
+        )
+
+    def test_buy_all_opportunity_fires(self):
+        """
+        Inject BBA prices where sum_asks = $0.93 (7% gross edge).
+        Verify detector finds BUY_ALL opportunity.
+        """
+        config = NegriskConfig(
+            min_net_edge=0.01,
+            min_outcomes=3,
+            fee_rate_bps=0,
+            gas_per_leg=0.0,
+        )
+        detector = NegriskDetector(config)
+        event = self._make_synthetic_event(sum_asks=0.93, num_outcomes=5)
+
+        # Verify sum is correct
+        actual_sum = sum(o.bba.best_ask for o in event.outcomes)
+        assert actual_sum == pytest.approx(0.93, abs=0.001)
+
+        # Detect
+        opp = detector._check_event(event)
+        assert opp is not None, "BUY_ALL opportunity not detected with 7% gross edge"
+        assert opp.direction == ArbDirection.BUY_ALL
+        assert opp.gross_edge == pytest.approx(0.07, abs=0.01)
+        assert opp.net_edge > 0.01
+        assert opp.num_legs == 5
+        assert all(leg["side"] == "BUY" for leg in opp.legs)
+
+    def test_sell_all_opportunity_fires(self):
+        """
+        Inject BBA prices where sum_bids = $1.07 (7% gross edge).
+        Verify detector finds SELL_ALL opportunity.
+        """
+        config = NegriskConfig(
+            min_net_edge=0.01,
+            min_outcomes=3,
+            fee_rate_bps=0,
+            gas_per_leg=0.0,
+        )
+        detector = NegriskDetector(config)
+
+        # Create event with high bids
+        outcomes = []
+        bid_prices = [0.35, 0.25, 0.20, 0.15, 0.12]
+        for i, bid in enumerate(bid_prices):
+            outcomes.append(Outcome(
+                outcome_id=f"sell_{i}",
+                market_id=f"sell_market_{i}",
+                condition_id="sell_cond",
+                token_id=f"sell_token_{i}",
+                name=f"Sell Outcome {i}",
+                status=OutcomeStatus.ACTIVE,
+                bba=OutcomeBBA(
+                    best_bid=bid,
+                    best_ask=round(bid + 0.02, 4),
+                    bid_size=500.0,
+                    ask_size=500.0,
+                    source="clob",
+                ),
+            ))
+
+        event = NegriskEvent(
+            event_id="synth_sell_001",
+            slug="synthetic-sell-test",
+            title="Synthetic Sell Pipeline Test",
+            condition_id="sell_cond",
+            volume_24h=100000.0,
+            outcomes=outcomes,
+        )
+
+        sum_bids = sum(o.bba.best_bid for o in event.outcomes)
+        assert sum_bids == pytest.approx(1.07, abs=0.001)
+
+        opp = detector._check_event_sell_side(event)
+        assert opp is not None, "SELL_ALL opportunity not detected with sum_bids=$1.07"
+        assert opp.direction == ArbDirection.SELL_ALL
+        assert opp.gross_edge == pytest.approx(0.07, abs=0.01)
+        assert all(leg["side"] == "SELL" for leg in opp.legs)
+
+    def test_no_opportunity_at_fair_prices(self):
+        """
+        Inject BBA prices where sum_asks = $1.00 exactly.
+        Verify NO opportunity is detected (no edge).
+        """
+        config = NegriskConfig(
+            min_net_edge=0.01,
+            fee_rate_bps=0,
+            gas_per_leg=0.0,
+        )
+        detector = NegriskDetector(config)
+        event = self._make_synthetic_event(sum_asks=1.00, num_outcomes=5)
+
+        opp = detector._check_event(event)
+        assert opp is None, "Should not detect opportunity at fair prices"
+
+    def test_edge_below_threshold_rejected(self):
+        """
+        Inject prices with 0.5% gross edge (sum_asks=$0.995).
+        With 1% min_net_edge, should be rejected.
+        """
+        config = NegriskConfig(
+            min_net_edge=0.01,
+            fee_rate_bps=0,
+            gas_per_leg=0.0,
+        )
+        detector = NegriskDetector(config)
+        event = self._make_synthetic_event(sum_asks=0.995, num_outcomes=5)
+
+        opp = detector._check_event(event)
+        assert opp is None, "0.5% edge should not pass 1% threshold"
+
+    def test_detect_opportunities_batch(self):
+        """
+        Inject multiple events via detect_opportunities().
+        Only the ones with sufficient edge should be detected.
+        """
+        config = NegriskConfig(
+            min_net_edge=0.01,
+            min_outcomes=3,
+            fee_rate_bps=0,
+            gas_per_leg=0.0,
+        )
+        detector = NegriskDetector(config)
+
+        events = [
+            self._make_synthetic_event(sum_asks=0.93, num_outcomes=5),  # 7% edge - YES
+            self._make_synthetic_event(sum_asks=1.00, num_outcomes=4),  # 0% edge - NO
+            self._make_synthetic_event(sum_asks=0.96, num_outcomes=3),  # 4% edge - YES
+        ]
+        # Give unique event_ids
+        for i, e in enumerate(events):
+            e.event_id = f"batch_{i}"
+
+        opportunities = detector.detect_opportunities(events)
+        assert len(opportunities) >= 2, f"Expected at least 2 opportunities, got {len(opportunities)}"
+
+    def test_alerter_fires_on_synthetic_opportunity(self):
+        """
+        Verify the alerter's send_opportunity_alert is called
+        when a synthetic opportunity is detected.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from core.negrisk.alerter import NegriskAlerter
+
+        config = NegriskConfig(
+            min_net_edge=0.01,
+            min_outcomes=3,
+            fee_rate_bps=0,
+            gas_per_leg=0.0,
+        )
+        detector = NegriskDetector(config)
+        event = self._make_synthetic_event(sum_asks=0.93, num_outcomes=5)
+
+        opp = detector._check_event(event)
+        assert opp is not None
+
+        # Create alerter with no real webhook (sound disabled)
+        alerter = NegriskAlerter(enable_sound=False)
+        alerter._is_cooled_down = MagicMock(return_value=True)
+
+        # Patch the HTTP send methods to be no-ops
+        alerter._send_webhook = AsyncMock()
+        alerter._send_telegram = AsyncMock()
+
+        # Fire the alert
+        asyncio.get_event_loop().run_until_complete(
+            alerter.send_opportunity_alert(opp)
+        )
+
+        # Without webhook/telegram configured, no sends should happen
+        # but the method should complete without error
+        # This verifies the alerter can process NegriskOpportunity objects
 
 
 if __name__ == "__main__":

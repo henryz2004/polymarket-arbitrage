@@ -1,0 +1,97 @@
+# Polymarket Neg-Risk Arbitrage Bot - Docker Compose
+#
+# Usage:
+#   # Scan-only mode (default):
+#   docker compose up -d negrisk-scanner
+#
+#   # With execution (dry-run):
+#   docker compose up -d negrisk-executor-dryrun
+#
+#   # With execution (LIVE - requires funded wallet):
+#   docker compose up -d negrisk-executor-live
+#
+#   # View logs:
+#   docker compose logs -f negrisk-scanner
+#
+#   # Stop:
+#   docker compose down
+
+services:
+  # Scanner-only: detect opportunities, collect backtesting data
+  negrisk-scanner:
+    build: .
+    container_name: negrisk-scanner
+    restart: unless-stopped
+    environment:
+      - TZ=UTC
+      # Webhook for alerts (set in .env or override)
+      - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-}
+    command: >
+      --edge 0.5
+      --staleness 300
+      --gamma-legs 2
+      --record
+      --duration 720
+    volumes:
+      - ./logs:/app/logs
+      - ./config.yaml:/app/config.yaml:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # Executor dry-run: simulates order placement
+  negrisk-executor-dryrun:
+    build: .
+    container_name: negrisk-executor-dryrun
+    restart: unless-stopped
+    environment:
+      - TZ=UTC
+      - POLYMARKET_PRIVATE_KEY=${POLYMARKET_PRIVATE_KEY}
+      - POLYMARKET_FUNDER=${POLYMARKET_FUNDER}
+      - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-}
+    command: >
+      --edge 0.5
+      --staleness 300
+      --gamma-legs 2
+      --record
+      --duration 720
+      --execute
+      --dry-run
+      --max-size 50
+    volumes:
+      - ./logs:/app/logs
+      - ./config.yaml:/app/config.yaml:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # Executor LIVE: real order placement (USE WITH CAUTION)
+  negrisk-executor-live:
+    build: .
+    container_name: negrisk-executor-live
+    restart: unless-stopped
+    environment:
+      - TZ=UTC
+      - POLYMARKET_PRIVATE_KEY=${POLYMARKET_PRIVATE_KEY}
+      - POLYMARKET_FUNDER=${POLYMARKET_FUNDER}
+      - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-}
+    command: >
+      --edge 1.0
+      --staleness 60
+      --gamma-legs 0
+      --record
+      --duration 720
+      --execute
+      --max-size 10
+    volumes:
+      - ./logs:/app/logs
+      - ./config.yaml:/app/config.yaml:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
