@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from core.watchdog.anomaly_detector import AnomalyDetector
-from core.watchdog.models import AnomalyAlert, PriceSnapshot, WatchdogConfig
+from core.watchdog.models import AnomalyAlert, NewsHeadline, PriceSnapshot, WatchdogConfig
 from core.watchdog.news_checker import NewsChecker
 from core.watchdog.price_tracker import PriceTracker, WatchedMarket
 from core.negrisk.models import NegriskEvent, Outcome, OutcomeBBA, OutcomeStatus
@@ -574,8 +574,8 @@ class TestNewsChecker:
     def _make_sample_rss():
         """Generate RSS with dates relative to now so tests don't go stale."""
         now = datetime.utcnow()
-        recent_1 = (now - timedelta(hours=1)).strftime("%a, %d %b %Y %H:%M:%S GMT")
-        recent_2 = (now - timedelta(hours=3)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        recent_1 = (now - timedelta(minutes=30)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        recent_2 = (now - timedelta(hours=1)).strftime("%a, %d %b %Y %H:%M:%S GMT")
         old = (now - timedelta(days=7)).strftime("%a, %d %b %Y %H:%M:%S GMT")
         return f"""<?xml version="1.0" encoding="UTF-8"?>
     <rss version="2.0">
@@ -592,6 +592,44 @@ class TestNewsChecker:
         <item>
           <title>Old article from last week about Iran</title>
           <pubDate>{old}</pubDate>
+        </item>
+      </channel>
+    </rss>"""
+
+    @staticmethod
+    def _make_rss_with_dateless():
+        """RSS with one dated and one dateless item."""
+        now = datetime.utcnow()
+        recent = (now - timedelta(minutes=30)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0">
+      <channel>
+        <item>
+          <title>US strikes Iran nuclear facilities</title>
+          <pubDate>{recent}</pubDate>
+        </item>
+        <item>
+          <title>Iran conflict update with no date</title>
+        </item>
+      </channel>
+    </rss>"""
+
+    @staticmethod
+    def _make_rss_with_post_move():
+        """RSS with items before and after a known move time."""
+        now = datetime.utcnow()
+        before_move = (now - timedelta(hours=2)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        after_move = (now - timedelta(minutes=5)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0">
+      <channel>
+        <item>
+          <title>US strikes Iran nuclear facilities in escalation</title>
+          <pubDate>{before_move}</pubDate>
+        </item>
+        <item>
+          <title>Iran strikes back after US military action today</title>
+          <pubDate>{after_move}</pubDate>
         </item>
       </channel>
     </rss>"""
@@ -620,7 +658,68 @@ class TestNewsChecker:
 
         # Should get 2 recent articles, old one filtered by date
         assert len(headlines) == 2
-        assert any("strikes" in h.lower() for h in headlines)
+        # Headlines are now NewsHeadline objects
+        assert all(isinstance(h, NewsHeadline) for h in headlines)
+        assert any("strikes" in h.title.lower() for h in headlines)
+        # Each headline should have a timestamp
+        assert all(h.published_at is not None for h in headlines)
+
+    def test_parse_rss_rejects_dateless(self):
+        """Headlines without pubDate are rejected."""
+        config = make_config(news_lookback_hours=6)
+        checker = NewsChecker(config)
+
+        headlines = checker._parse_rss(self._make_rss_with_dateless())
+
+        # Only the dated item should survive
+        assert len(headlines) == 1
+        assert "nuclear" in headlines[0].title.lower()
+
+    def test_parse_rss_move_started_at_filter(self):
+        """Headlines published after price move are filtered out."""
+        now = datetime.utcnow()
+        config = make_config(news_lookback_hours=6)
+        checker = NewsChecker(config)
+
+        # Move started 1 hour ago — headline from 2h ago is OK,
+        # headline from 5min ago is after the move and should be filtered
+        move_started_at = now - timedelta(hours=1)
+
+        headlines = checker._parse_rss(
+            self._make_rss_with_post_move(),
+            move_started_at=move_started_at,
+        )
+
+        # Only the pre-move headline should survive
+        assert len(headlines) == 1
+        assert "escalation" in headlines[0].title.lower()
+
+    def test_parse_rss_move_grace_window(self):
+        """Headlines within grace window after move start are still included."""
+        now = datetime.utcnow()
+        config = make_config(news_lookback_hours=6)
+        checker = NewsChecker(config)
+
+        # Make RSS with an item published 10 min after the move started
+        # (within the 15-min grace window)
+        move_time = now - timedelta(minutes=30)
+        headline_time = (move_time + timedelta(minutes=10)).strftime(
+            "%a, %d %b %Y %H:%M:%S GMT"
+        )
+        rss = f"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0">
+      <channel>
+        <item>
+          <title>US strikes Iran nuclear facilities in escalation</title>
+          <pubDate>{headline_time}</pubDate>
+        </item>
+      </channel>
+    </rss>"""
+
+        headlines = checker._parse_rss(rss, move_started_at=move_time)
+
+        # Within grace window — should be included
+        assert len(headlines) == 1
 
     def test_parse_rss_empty(self):
         """Empty RSS returns empty list."""
@@ -652,8 +751,8 @@ class TestNewsChecker:
 
     @pytest.mark.asyncio
     async def test_fetch_headlines_mocked(self):
-        """fetch_headlines with mocked HTTP response."""
-        config = make_config()
+        """fetch_headlines with mocked HTTP response returns NewsHeadline objects."""
+        config = make_config(news_lookback_hours=6)
         checker = NewsChecker(config)
 
         # Mock the HTTP client
@@ -668,7 +767,71 @@ class TestNewsChecker:
         headlines = await checker.fetch_headlines("US Strikes Iran by Feb 28")
 
         assert len(headlines) >= 1
+        assert all(isinstance(h, NewsHeadline) for h in headlines)
+        assert all(h.published_at is not None for h in headlines)
         mock_client.get.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_fetch_headlines_with_move_started_at(self):
+        """fetch_headlines passes move_started_at to RSS parser."""
+        now = datetime.utcnow()
+        config = make_config(news_lookback_hours=6)
+        checker = NewsChecker(config)
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.text = self._make_rss_with_post_move()
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_response)
+        checker._http_client = mock_client
+
+        # Move started 1h ago — post-move headline should be filtered
+        move_started_at = now - timedelta(hours=1)
+        headlines = await checker.fetch_headlines(
+            "US Strikes Iran by Feb 28",
+            move_started_at=move_started_at,
+        )
+
+        # Only pre-move headline should survive (if it passes keyword filter)
+        for h in headlines:
+            assert h.published_at <= move_started_at + timedelta(minutes=15)
+
+
+# ──────────────────────────────────────────────────────────────
+# NewsHeadline Tests
+# ──────────────────────────────────────────────────────────────
+
+class TestNewsHeadline:
+    """Test NewsHeadline model."""
+
+    def test_to_dict(self):
+        """to_dict includes title and published_at ISO string."""
+        h = NewsHeadline(title="Breaking news", published_at=datetime(2026, 4, 2, 12, 30, 0))
+        d = h.to_dict()
+        assert d["title"] == "Breaking news"
+        assert d["published_at"] == "2026-04-02T12:30:00"
+
+    def test_to_dict_no_date(self):
+        """to_dict handles None published_at."""
+        h = NewsHeadline(title="Breaking news")
+        d = h.to_dict()
+        assert d["published_at"] is None
+
+    def test_age_minutes(self):
+        """age_minutes computes correctly."""
+        h = NewsHeadline(
+            title="Test",
+            published_at=datetime.utcnow() - timedelta(minutes=45),
+        )
+        age = h.age_minutes
+        assert age is not None
+        assert 44 < age < 46
+
+    def test_age_minutes_none(self):
+        """age_minutes is None when no published_at."""
+        h = NewsHeadline(title="Test")
+        assert h.age_minutes is None
 
 
 # ──────────────────────────────────────────────────────────────
@@ -696,7 +859,7 @@ class TestAnomalyAlert:
             suspicion_score=7.5,
             is_off_hours=True,
             event_volume_24h=89600000.0,
-            news_headlines=["Iran tensions rise"],
+            news_headlines=[NewsHeadline(title="Iran tensions rise", published_at=datetime.utcnow())],
             news_driven=True,
         )
 
@@ -707,6 +870,8 @@ class TestAnomalyAlert:
         assert d["suspicion_score"] == 7.5
         assert d["is_off_hours"] is True
         assert len(d["news_headlines"]) == 1
+        assert d["news_headlines"][0]["title"] == "Iran tensions rise"
+        assert d["news_headlines"][0]["published_at"] is not None
         assert d["news_driven"] is True
         assert "detected_at" in d
 
@@ -723,7 +888,7 @@ class TestAnomalyAlert:
             price_before=0.07, price_after=0.195, pct_change=1.79,
             abs_change=0.125, window_seconds=2100, threshold_type="relative",
             suspicion_score=7.5, is_off_hours=False, event_volume_24h=50000,
-            news_headlines=["Breaking: event happened"],
+            news_headlines=[NewsHeadline(title="Breaking: event happened", published_at=datetime.utcnow())],
             news_driven=True,
         )
 

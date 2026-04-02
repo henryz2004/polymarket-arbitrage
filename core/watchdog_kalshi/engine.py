@@ -362,8 +362,12 @@ class KalshiWatchdogEngine:
         """Enrich alert with news headlines and dispatch."""
         if self.config.news_check_enabled:
             try:
+                from datetime import timedelta
+                move_started_at = alert.detected_at - timedelta(seconds=alert.window_seconds)
+
                 headlines = await self.news_checker.fetch_headlines(
-                    alert.event_title
+                    alert.event_title,
+                    move_started_at=move_started_at,
                 )
                 alert.news_headlines = headlines
                 alert.news_driven = len(headlines) > 0
