@@ -4,7 +4,12 @@ This file provides repository-specific guidance for coding agents working in thi
 
 ## Project Overview
 
-Python 3.10+ async arbitrage trading bot for Polymarket and Kalshi prediction markets. Features a real-time web dashboard, risk management, and both simulation and live trading modes.
+This repo is organized as a monorepo with two first-class apps:
+
+- `negrisk`: arbitrage scanning, trading, and dashboards
+- `watchdog`: suspicious-activity detection, alerting, and backtesting
+
+Both apps share market-data primitives under `core/shared/markets/`.
 
 ## Commands
 
@@ -36,10 +41,13 @@ python -m apps.negrisk long-test --duration 4
 # Run neg-risk overnight test (12 hours, custom edge)
 python -m apps.negrisk long-test --duration 12 --edge 1.5
 
-# Run watchdog (suspicious activity scanner, 24h default)
+# Run Polymarket watchdog (suspicious activity scanner, 24h default)
 python -m apps.watchdog scan --platform polymarket
 
-# Run watchdog with custom args
+# Run Kalshi watchdog
+python -m apps.watchdog scan --platform kalshi
+
+# Run Polymarket watchdog with custom args
 python -m apps.watchdog scan --platform polymarket --duration 24 --min-volume 10000
 
 # Run watchdog in tmux (recommended for long runs)
@@ -64,36 +72,21 @@ mypy .
 ## Architecture
 
 ```text
-TradingBot
-├── PolymarketClient / KalshiClient  # API clients for each exchange
-├── DataFeed                          # Real-time market data manager
-├── ArbEngine                         # Single-platform bundle arbitrage (YES+NO)
-├── CrossPlatformArbEngine            # Cross-platform arbitrage (Polymarket vs Kalshi)
-├── NegriskEngine                     # Neg-risk multi-outcome arbitrage
-│   ├── NegriskRegistry               #   Event discovery + priority scoring from Gamma API
-│   ├── BBATracker                    #   Real-time BBA via WebSocket + CLOB seeding/re-seeding
-│   ├── NegriskDetector               #   Multi-outcome detection (BUY_ALL + SELL_ALL)
-│   ├── BinaryBundleDetector          #   Binary YES+NO bundle detection (BUY_BINARY + SELL_BINARY)
-│   └── PartialPositionDetector       #   +EV partial subset detection (not riskless, disabled by default)
-├── WatchdogEngine                    # Suspicious activity detection scanner
-│   ├── PriceTracker                  #   Rolling price history per token
-│   ├── AnomalyDetector               #   Spike detection + suspicion scoring
-│   ├── NewsChecker                   #   Google News RSS headline correlation
-│   └── AlertDispatcher               #   Console + JSONL alert output
-├── ExecutionEngine                   # Order placement with signal dedup + cooldowns
-├── RiskManager                       # Position/loss limits, kill switch
-├── Portfolio                         # Position and PnL tracking
-└── DashboardIntegration              # WebSocket bridge to dashboard UI
+apps/
+├── negrisk/                     # Negrisk CLI + runtime entrypoints
+└── watchdog/                    # Watchdog CLI + runtime entrypoints
+
+core/
+├── shared/markets/             # Shared event/outcome/BBA models + protocols
+├── negrisk/                    # Neg-risk arbitrage logic
+├── watchdog/                   # Watchdog logic + platform adapters
+├── arb_engine.py               # Single-platform bundle arbitrage
+├── cross_platform_arb.py       # Cross-platform arbitrage
+├── data_feed.py                # Real-time market data manager
+├── execution.py                # Order placement with signal dedup + cooldowns
+├── risk_manager.py             # Position/loss limits, kill switch
+└── portfolio.py                # Position and PnL tracking
 ```
-
-### Data Flow (Bundle/Cross-Platform)
-
-1. `DataFeed` updates markets, order books, and positions in real time.
-2. `ArbEngine` analyzes market state and generates signals for bundle arbitrage.
-3. `CrossPlatformArbEngine` matches markets across platforms using text similarity.
-4. `ExecutionEngine` places orders while respecting risk limits.
-5. `Portfolio` tracks positions and PnL.
-6. The dashboard displays real-time state via WebSocket.
 
 ### Data Flow (Neg-Risk)
 
@@ -109,13 +102,20 @@ TradingBot
 5. `NegriskEngine` orchestrates scanning with event priority sorting and `ws_only_mode`.
 6. Production safety includes stale-data validation, signal deduplication, execution cooldowns, and WebSocket connectivity tracking.
 
-### `ws_only_mode`
+### Data Flow (Watchdog)
 
-Skips CLOB fetches before execution and trusts WebSocket data for lower latency. Additional safeguards include staleness checks and re-validation before execution. Enable with `NegriskConfig(ws_only_mode=True)`.
+1. A watchdog platform adapter discovers markets and streams live price updates.
+2. `PriceTracker` stores rolling history.
+3. `AnomalyDetector` scores suspicious moves.
+4. `NewsChecker` classifies alerts as `NEWS-DRIVEN` vs `UNEXPLAINED`.
+5. `AlertDispatcher` sends alerts to console, JSONL, and Discord when `ALERT_WEBHOOK_URL` is set.
 
 ## Key Directories
 
-- `core/` - Trading logic: `arb_engine.py`, `cross_platform_arb.py`, `execution.py`, `risk_manager.py`, `portfolio.py`, `data_feed.py`
+- `apps/negrisk/` - Negrisk app entrypoints: `scan.py`, `dashboard.py`, `long_test.py`
+- `apps/watchdog/` - Watchdog app entrypoints: `polymarket_runner.py`, `kalshi_runner.py`, `backtest.py`
+- `core/` - Shared trading logic: `arb_engine.py`, `cross_platform_arb.py`, `execution.py`, `risk_manager.py`, `portfolio.py`, `data_feed.py`
+- `core/shared/markets/` - Shared event/outcome/BBA models and protocols
 - `core/negrisk/` - Neg-risk arbitrage
 - `polymarket_client/` - Polymarket REST and WebSocket client plus data models
 - `kalshi_client/` - Kalshi REST client plus data models
@@ -145,7 +145,11 @@ Skips CLOB fetches before execution and trusts WebSocket data for lower latency.
 
 ## Configuration
 
-Primary negrisk config: `config/negrisk.yaml`
+Primary configs:
+
+- `config/negrisk.yaml`
+- `config/watchdog.polymarket.yaml`
+- `config/watchdog.kalshi.yaml`
 
 - `mode.trading_mode`: `dry_run` or `live`
 - `mode.data_mode`: `real` or `simulation`
@@ -213,8 +217,15 @@ Defined in `WatchdogConfig` in `core/watchdog/models.py`.
 - `news_lookback_hours`: headline matching lookback window, default 6
 - `warmup_seconds`: suppress alerts until enough live data exists, default 300
 - `min_price_floor`: ignore outcomes below this price, default 3 cents
+- `resolution_price_ceiling`: suppress near-resolution alerts, default 95 cents
 
 Alert fields include `news_driven: bool`. `True` means correlated headlines were found; `False` means the move was unexplained. Alerts are written to `logs/watchdog/alerts_YYYYMMDD.jsonl`.
+
+### Watchdog Runtime Env
+
+- `ALERT_WEBHOOK_URL` - Discord webhook for watchdog alerts
+- `KALSHI_API_KEY` - Kalshi API key for authenticated watchdog runs
+- `KALSHI_PRIVATE_KEY` or `KALSHI_PRIVATE_KEY_PATH` - Kalshi private key material
 
 ### Long-Term Testing
 

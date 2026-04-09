@@ -15,6 +15,11 @@ python -m apps.watchdog backtest
 - Polymarket defaults: [config/watchdog.polymarket.yaml](/Users/henryz2004/code/negrisk/polymarket-arbitrage/config/watchdog.polymarket.yaml)
 - Kalshi defaults: [config/watchdog.kalshi.yaml](/Users/henryz2004/code/negrisk/polymarket-arbitrage/config/watchdog.kalshi.yaml)
 
+## Runtime Env
+
+- `ALERT_WEBHOOK_URL` for Discord alert delivery
+- `KALSHI_API_KEY` plus `KALSHI_PRIVATE_KEY` or `KALSHI_PRIVATE_KEY_PATH` for authenticated Kalshi runs
+
 ## Code Ownership
 
 - `core/watchdog/`: anomaly detection, price history, alerts, news correlation
@@ -26,3 +31,4 @@ python -m apps.watchdog backtest
 
 - Product-specific tests live under [tests/watchdog](/Users/henryz2004/code/negrisk/polymarket-arbitrage/tests/watchdog).
 - The Kalshi watchdog is now treated as a watchdog platform, not a separate top-level product.
+- `main` now treats `python -m apps.watchdog ...` as the supported interface.

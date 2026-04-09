@@ -10,16 +10,18 @@ from __future__ import annotations
 
 from typing import Callable, Optional
 
-from core.shared.markets.models import MarketDataConfig
-
-
 class PolymarketWatchdogMarketData:
     """Platform adapter for Polymarket watchdog discovery + BBA tracking."""
 
     def __init__(self, min_outcomes: int, min_event_volume_24h: float,
                  registry_refresh_seconds: float, bba_ws_reconnect_delay: float,
                  staleness_ttl_ms: float):
-        self.config = MarketDataConfig(
+        from core.negrisk.models import NegriskConfig
+
+        # The watchdog reuses the Polymarket neg-risk registry and BBA tracker.
+        # Those components expect the richer NegriskConfig surface even when
+        # watchdog_mode disables the trading-specific behavior.
+        self.config = NegriskConfig(
             min_outcomes=min_outcomes,
             min_event_volume_24h=min_event_volume_24h,
             registry_refresh_seconds=registry_refresh_seconds,

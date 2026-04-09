@@ -6,10 +6,39 @@ keywords:
   - sanctions
   - invasion
   - military
+  - ceasefire
+  - missile
+  - nuclear
+  - tariff
+  - fed
+  - fomc
+  - powell
+  - sec
+  - doj
+  - indictment
+  - approval
+  - ban
+  - merger
+  - earnings
+  - guidance
+  - etf
+  - cabinet
+  - nominee
+  - rate cut
+  - rate hike
 watch_slugs:
   - us-x-iran-ceasefire-by
   - us-forces-enter-iran-by
   - usisrael-strikes-iran-by
+  - usisrael-strikes-iran-on
+  - iran-x-israelus-conflict-ends-by
+  - will-us-or-israel-strike-iran-first
+  - iran-leadership-change-or-us-x-iran-ceasefire-first
+  - us-x-iran-ceasefire-before-trump-visits-china
+  - trump-announces-end-of-military-operations-against-iran-by
+  - fed-decision-in-september
+  - sec-approve-spot-xrp-etf-in-2026
+  - tiktok-banned-in-the-us-by
 min_volume: 10000
 poll_interval: 60
 cooldown: 300

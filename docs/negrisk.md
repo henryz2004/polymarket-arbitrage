@@ -14,8 +14,6 @@ python -m apps.negrisk long-test --duration 4 --edge 1.5
 
 Default config: [config/negrisk.yaml](/Users/henryz2004/code/negrisk/polymarket-arbitrage/config/negrisk.yaml)
 
-Compatibility config: [config.yaml](/Users/henryz2004/code/negrisk/polymarket-arbitrage/config.yaml)
-
 ## Code Ownership
 
 - `core/negrisk/`: neg-risk registry, BBA tracking, detection, execution
@@ -27,3 +25,4 @@ Compatibility config: [config.yaml](/Users/henryz2004/code/negrisk/polymarket-ar
 - Use the `dashboard` subcommand for the live UI.
 - Use the `long-test` subcommand for extended scan and execution validation.
 - Product-specific tests live under [tests/negrisk](/Users/henryz2004/code/negrisk/polymarket-arbitrage/tests/negrisk).
+- `main` now treats `python -m apps.negrisk ...` as the supported interface.

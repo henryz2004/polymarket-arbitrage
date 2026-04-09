@@ -4,13 +4,28 @@ keywords:
   - war
   - attack
   - sanctions
+  - election
+  - tariff
+  - inflation
+  - fed
+  - trump
+  - senate
+  - house
+  - ceasefire
+  - israel
+  - iran
+  - china
 watch_events: []
 watch_series: []
 categories:
   - politics
   - world
   - geopolitics
-min_volume: 5000
+  - economics
+  - crypto
+  - technology
+  - financials
+min_volume: 500
 poll_interval: 60
 cooldown: 300
 news_check_enabled: true

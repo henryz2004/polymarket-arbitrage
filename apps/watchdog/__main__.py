@@ -81,24 +81,21 @@ def main() -> None:
     scan_parser = subparsers.add_parser("scan", help="Run suspicious-activity watchdog")
     scan_parser.add_argument("--platform", choices=("polymarket", "kalshi"), default="polymarket")
     scan_parser.add_argument("--config", default=None)
-    scan_parser.add_argument("args", nargs=argparse.REMAINDER)
-
     backtest_parser = subparsers.add_parser("backtest", help="Run watchdog backtests")
-    backtest_parser.add_argument("args", nargs=argparse.REMAINDER)
 
     args, unknown = parser.parse_known_args()
 
     if args.command == "backtest":
-        _run_backtest([*args.args, *unknown])
+        _run_backtest(unknown)
         return
 
     if args.platform == "kalshi":
         config_path = args.config or "config/watchdog.kalshi.yaml"
-        _run_kalshi_scan(config_path, [*args.args, *unknown])
+        _run_kalshi_scan(config_path, unknown)
         return
 
     config_path = args.config or "config/watchdog.polymarket.yaml"
-    _run_polymarket_scan(config_path, [*args.args, *unknown])
+    _run_polymarket_scan(config_path, unknown)
 
 
 if __name__ == "__main__":
