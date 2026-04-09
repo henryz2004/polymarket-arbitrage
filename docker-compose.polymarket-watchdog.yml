@@ -14,10 +14,13 @@ services:
       - --config
       - config/watchdog.polymarket.yaml
     volumes:
-      - ./logs:/app/logs
+      - polymarket_watchdog_logs:/app/logs
       - ./config:/app/config:ro
     logging:
       driver: json-file
       options:
         max-size: "50m"
         max-file: "5"
+
+volumes:
+  polymarket_watchdog_logs:
