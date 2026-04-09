@@ -71,7 +71,8 @@ class NegriskLongTest:
                  execute: bool = False,
                  dry_run: bool = True,
                  max_trade_usd: float = 50.0,
-                 record: bool = False):
+                 record: bool = False,
+                 ws_only: bool = False):
         self.duration = timedelta(hours=duration_hours)
         self.min_net_edge = min_net_edge
         self.min_liquidity_per_outcome = min_liquidity_per_outcome
@@ -84,6 +85,7 @@ class NegriskLongTest:
         self.dry_run_mode = dry_run
         self.max_trade_usd = max_trade_usd
         self.record = record
+        self.ws_only = ws_only
         self._limitless_executor = None
         self._polymarket_executor = None
         self._recorder: Optional[BBARecorder] = None
@@ -106,7 +108,7 @@ class NegriskLongTest:
         # Configuration
         self.config = NegriskConfig(
             min_net_edge=min_net_edge,
-            min_outcomes=3,
+            min_outcomes=2,                   # Include 2-outcome events for binary bundle arb
             max_legs=15,
             staleness_ttl_ms=self.staleness_ttl_seconds * 1000.0,
             fee_rate_bps=0,               # Most neg-risk markets are fee-free
@@ -118,6 +120,9 @@ class NegriskLongTest:
             max_gamma_only_legs=self.max_gamma_only_legs,
             skip_augmented_placeholders=True,
             registry_refresh_seconds=300.0,  # 5 min — event list barely changes, avoids 429s
+            reseed_interval_seconds=120.0,  # Re-seed gamma-only tokens every 2 min for fresher coverage
+            binary_bundle_enabled=True,      # YES+NO bundle arb on 2-outcome events
+            ws_only_mode=self.ws_only,
         )
 
         # Components
@@ -132,7 +137,7 @@ class NegriskLongTest:
 
         # Dedup: suppress repeated alerts for the same event within cooldown
         self._last_alert_time: dict[str, datetime] = {}
-        self._alert_cooldown = timedelta(minutes=5)
+        self._alert_cooldown = timedelta(seconds=30)
         self._dedup_suppressed = 0
 
         # Metrics
@@ -541,7 +546,7 @@ class NegriskLongTest:
                     await self.stop()
                     break
 
-                await asyncio.sleep(2)  # Scan every 2 seconds
+                await asyncio.sleep(30)  # Fallback only — event-driven callback handles real-time detection
 
                 if not self.registry or not self.detector:
                     continue
@@ -572,8 +577,8 @@ class NegriskLongTest:
                         if self._active_executor:
                             await self._execute_opportunity(opp)
 
-                # Log scan stats every 100 scans (~3 min at 2s interval)
-                if self.total_scans % 100 == 0:
+                # Log scan stats every 5 fallback scans (~2.5 min at 30s interval)
+                if self.total_scans % 5 == 0:
                     det_stats = self.detector.get_stats_dict()
                     total_events = len(self.registry.get_event_ids()) if self.registry else 0
                     self.logger.info(f"Scan #{self.total_scans}: {len(events)}/{total_events} events checked (pre-filtered), "
@@ -825,6 +830,8 @@ async def main():
                        help='Max USD per trade (default: 50)')
     parser.add_argument('--record', action='store_true', default=False,
                        help='Record BBA data for offline backtesting')
+    parser.add_argument('--ws-only', action='store_true', default=False,
+                       help='Skip CLOB re-validation before execution, trust WebSocket data for lower latency')
 
     args = parser.parse_args()
 
@@ -903,6 +910,7 @@ async def main():
         dry_run=args.dry_run,
         max_trade_usd=args.max_size,
         record=args.record,
+        ws_only=args.ws_only,
     )
 
     try:

@@ -418,7 +418,7 @@ class NegriskDetector:
             self.stats.edge_too_low_rejections += 1
             # Log top candidates so we can sanity-check the fee math
             if gross_edge > 0:
-                logger.debug(
+                logger.info(
                     f"EDGE_REJECT: {event.title[:60]} | legs={num_legs} | "
                     f"sum_asks={sum_of_asks:.4f} | gross={gross_edge:.4f} ({gross_edge*100:.2f}%) | "
                     f"fee={fee_per_share:.4f} | gas/sh={gas_per_share:.6f} | "
@@ -593,7 +593,7 @@ class NegriskDetector:
         if net_edge < effective_min_edge:
             self.stats.edge_too_low_rejections += 1
             if gross_edge > 0:
-                logger.debug(
+                logger.info(
                     f"MAKER_EDGE_REJECT: {event.title[:60]} | legs={num_legs} | "
                     f"sum_prices={sum_of_prices:.4f} | gross={gross_edge:.4f} ({gross_edge*100:.2f}%) | "
                     f"fee={fee_per_share:.4f} | gas/sh={gas_per_share:.6f} | "
@@ -828,7 +828,7 @@ class NegriskDetector:
         if net_edge < effective_min_edge:
             self.stats.edge_too_low_rejections += 1
             if gross_edge > 0:
-                logger.debug(
+                logger.info(
                     f"SELL_EDGE_REJECT: {event.title[:60]} | legs={num_legs} | "
                     f"sum_bids={sum_of_bids:.4f} | gross={gross_edge:.4f} ({gross_edge*100:.2f}%) | "
                     f"fee={fee_per_share:.4f} | gas/sh={gas_per_share:.6f} | "
@@ -1003,7 +1003,7 @@ class NegriskDetector:
         if net_edge < effective_min_edge:
             self.stats.edge_too_low_rejections += 1
             if gross_edge > 0:
-                logger.debug(
+                logger.info(
                     f"SELL_MAKER_EDGE_REJECT: {event.title[:60]} | legs={num_legs} | "
                     f"sum_prices={sum_of_prices:.4f} | gross={gross_edge:.4f} ({gross_edge*100:.2f}%) | "
                     f"fee={fee_per_share:.4f} | gas/sh={gas_per_share:.6f} | "

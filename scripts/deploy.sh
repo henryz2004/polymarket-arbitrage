@@ -91,9 +91,7 @@ rsync -avz --progress \
     --exclude='*.png' \
     --exclude='worktrees/' \
     --exclude='tests/' \
-    --exclude='test_*.py' \
     --exclude='*.sh' \
-    --include='scripts/deploy.sh' \
     ./ "${REMOTE_HOST}:${REMOTE_DIR}/"
 
 # Sync .env if it exists (with restrictive permissions)

@@ -64,7 +64,7 @@ SPENDERS = [
     CONTRACTS["Neg Risk Adapter"],
 ]
 
-DEFAULT_RPC = "https://polygon-rpc.com"
+DEFAULT_RPC = "https://polygon-bor-rpc.publicnode.com"
 
 
 def _encode_approve(spender: str, amount: str = MAX_UINT256) -> str:

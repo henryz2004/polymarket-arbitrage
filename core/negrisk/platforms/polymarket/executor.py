@@ -10,9 +10,10 @@ when a PolymarketExecutor is provided, bypassing the older ExecutionEngine
 
 Execution flow:
 1. Pre-flight: Kill switch check, max trade size cap, USDC.e balance check
-2. Slippage check on each leg via py-clob-client.get_order_book()
-3. Sequential FOK orders for each leg. Abort on first failure.
-4. Rollback: If legs 1-N filled but leg N+1 failed, sell legs 1-N back.
+2. Slippage check on each leg via py-clob-client.get_order_book() (parallel)
+3. Batch FOK orders via post_orders() (single HTTP call for all legs)
+4. Rollback: If some legs filled but others failed, sell filled legs back.
+   Falls back to sequential placement if batch API fails.
 
 Pre-flight:
   1. Get a Polygon wallet with USDC.e
@@ -280,31 +281,30 @@ class PolymarketExecutor:
                     execution_time_ms=elapsed,
                 )
 
-        # Step 2: Sequential FOK order placement
-        placed_orders: list[LegOrderResult] = []
-        for i, leg in enumerate(opportunity.legs):
-            result = await self._place_leg_order(leg)
-            placed_orders.append(result)
+        # Step 2: Batch FOK order placement (single HTTP call for all legs)
+        placed_orders = await self._place_legs_batch(opportunity.legs)
 
-            if not result.success:
+        filled = [o for o in placed_orders if o.success]
+        failed = [o for o in placed_orders if not o.success]
+
+        if failed:
+            # Partial or full failure — rollback any filled legs
+            if filled:
                 logger.warning(
-                    f"Leg {i + 1}/{len(opportunity.legs)} failed for "
-                    f"{leg['outcome_name']}: {result.error}"
+                    f"{len(filled)}/{len(placed_orders)} legs filled, "
+                    f"{len(failed)} failed — rolling back"
                 )
+                await self._rollback_orders(filled)
 
-                # Rollback previously filled legs
-                filled = [o for o in placed_orders[:-1] if o.success]
-                if filled:
-                    await self._rollback_orders(filled)
-
-                elapsed = (time.monotonic() - start_time) * 1000
-                self._stats["executions_failed"] += 1
-                return ExecutionResult(
-                    success=False,
-                    reason=f"Leg {i + 1} failed: {result.error}",
-                    orders=placed_orders,
-                    execution_time_ms=elapsed,
-                )
+            elapsed = (time.monotonic() - start_time) * 1000
+            self._stats["executions_failed"] += 1
+            first_error = failed[0].error or "unknown"
+            return ExecutionResult(
+                success=False,
+                reason=f"{len(failed)}/{len(placed_orders)} legs failed: {first_error}",
+                orders=placed_orders,
+                execution_time_ms=elapsed,
+            )
 
         # All legs succeeded
         elapsed = (time.monotonic() - start_time) * 1000
@@ -313,13 +313,13 @@ class PolymarketExecutor:
         self._stats["total_volume_usd"] += total_cost
 
         logger.info(
-            f"Polymarket execution SUCCESS: {len(placed_orders)} legs filled, "
-            f"cost=${total_cost:.2f}, time={elapsed:.0f}ms"
+            f"Polymarket execution SUCCESS: {len(placed_orders)} legs filled "
+            f"(batch), cost=${total_cost:.2f}, time={elapsed:.0f}ms"
         )
 
         return ExecutionResult(
             success=True,
-            reason="All legs filled",
+            reason="All legs filled (batch)",
             orders=placed_orders,
             total_cost=total_cost,
             execution_time_ms=elapsed,
@@ -403,6 +403,135 @@ class PolymarketExecutor:
         except Exception as e:
             logger.warning(f"Slippage check error for {leg['token_id'][:16]}: {e}")
             return False
+
+    async def _place_legs_batch(self, legs: list[dict]) -> list[LegOrderResult]:
+        """
+        Place all leg orders in a single batch via post_orders().
+
+        Creates signed orders locally (~1ms each, no network) then submits
+        all in one HTTP call instead of N sequential calls. This reduces
+        execution latency from ~150ms × N legs to ~150ms total.
+
+        Falls back to sequential placement if batch API fails.
+
+        Args:
+            legs: List of leg dicts from NegriskOpportunity.legs
+
+        Returns:
+            List of LegOrderResult, one per leg
+        """
+        try:
+            from py_clob_client.clob_types import (
+                OrderArgs, PostOrdersArgs, OrderType, CreateOrderOptions
+            )
+            from py_clob_client.order_builder.constants import BUY, SELL
+
+            # Step 1: Create all signed orders locally (fast, no network)
+            tick = float(self.tick_size)
+            batch_args = []
+            for leg in legs:
+                sdk_side = BUY if leg["side"] == "BUY" else SELL
+
+                # Worst-price limit with slippage tolerance, rounded to tick size
+                if leg["side"] == "BUY":
+                    raw_price = min(
+                        leg["price"] * (1 + self.slippage_tolerance), 0.99
+                    )
+                    # Round UP to nearest tick for BUY (willing to pay more)
+                    worst_price = round(
+                        min(round(raw_price / tick) * tick + tick, 0.99),
+                        len(self.tick_size.split(".")[-1]) if "." in self.tick_size else 1,
+                    )
+                else:
+                    raw_price = max(
+                        leg["price"] * (1 - self.slippage_tolerance), 0.01
+                    )
+                    # Round DOWN to nearest tick for SELL (willing to accept less)
+                    worst_price = round(
+                        max(round(raw_price / tick) * tick, 0.01),
+                        len(self.tick_size.split(".")[-1]) if "." in self.tick_size else 1,
+                    )
+
+                options = CreateOrderOptions(
+                    tick_size=self.tick_size,
+                    neg_risk=True,
+                )
+
+                signed_order = self._clob_client.create_order(
+                    OrderArgs(
+                        token_id=leg["token_id"],
+                        price=worst_price,
+                        size=leg["size"],
+                        side=sdk_side,
+                    ),
+                    options=options,
+                )
+
+                batch_args.append(PostOrdersArgs(
+                    order=signed_order,
+                    orderType=OrderType.FOK,
+                ))
+
+            logger.info(
+                f"Placing batch of {len(batch_args)} FOK orders via post_orders()"
+            )
+
+            # Step 2: Submit all orders in one HTTP call
+            resp = self._clob_client.post_orders(batch_args)
+
+            # Step 3: Parse batch response
+            results = []
+            # Response format may vary — handle list and dict formats
+            if isinstance(resp, list):
+                order_responses = resp
+            elif isinstance(resp, dict):
+                order_responses = resp.get("orders", resp.get("results", [resp]))
+            else:
+                order_responses = [{}] * len(legs)
+
+            for i, leg in enumerate(legs):
+                if i < len(order_responses):
+                    order_resp = order_responses[i] if isinstance(order_responses[i], dict) else {}
+                    order_id = order_resp.get("orderID", f"batch_{i}")
+                    status = order_resp.get("status", "unknown")
+                    success = status in ("matched", "live")
+
+                    logger.info(
+                        f"Batch leg {i + 1}/{len(legs)}: "
+                        f"{leg['outcome_name'][:30]} | "
+                        f"status={status} | id={order_id}"
+                    )
+
+                    results.append(LegOrderResult(
+                        success=success,
+                        order_id=order_id,
+                        token_id=leg["token_id"],
+                        side=leg["side"],
+                        price=leg["price"],
+                        size=leg["size"],
+                        filled_size=leg["size"] if success else 0.0,
+                        error=None if success else f"Batch order not filled: status={status}",
+                    ))
+                else:
+                    results.append(LegOrderResult(
+                        success=False,
+                        token_id=leg["token_id"],
+                        side=leg["side"],
+                        price=leg["price"],
+                        size=leg["size"],
+                        error="No response for this leg in batch",
+                    ))
+
+            return results
+
+        except Exception as e:
+            logger.warning(f"Batch placement failed ({e}), falling back to sequential")
+            # Fall back to sequential placement
+            results = []
+            for leg in legs:
+                result = await self._place_leg_order(leg)
+                results.append(result)
+            return results
 
     async def _place_leg_order(self, leg: dict) -> LegOrderResult:
         """

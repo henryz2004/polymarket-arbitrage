@@ -37,6 +37,7 @@ CLAUDE.md
 tests/
 test_*.py
 *_test.py
+!negrisk_long_test.py
 
 # Shell scripts (local only)
 *.sh

@@ -263,12 +263,12 @@ class NegriskEngine:
         except Exception as e:
             logger.debug(f"Event scan error for {event_id}: {e}")
         finally:
-            # Keep event in active scans for 150ms after completion
+            # Keep event in active scans for 25ms after completion
             # to prevent immediate re-scan from the next WS tick.
-            # Short cooldown is safe because the detector has its own 2s
-            # opportunity cooldown and the engine has a 5s execution cooldown.
+            # Short cooldown is safe because the detector has its own
+            # opportunity cooldown and the engine has an execution cooldown.
             async def _clear_after_delay(eid: str = event_id) -> None:
-                await asyncio.sleep(0.15)
+                await asyncio.sleep(0.025)
                 self._active_event_scans.discard(eid)
             asyncio.create_task(_clear_after_delay())
 
