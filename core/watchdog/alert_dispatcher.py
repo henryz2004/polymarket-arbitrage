@@ -111,7 +111,16 @@ class ConsoleChannel(AlertChannel):
         if alert.news_headlines:
             print(f"  News:    {len(alert.news_headlines)} matching headline(s):")
             for i, headline in enumerate(alert.news_headlines[:3]):
-                print(f"           {i+1}. {headline[:80]}")
+                # Support both NewsHeadline objects and plain strings (legacy)
+                if hasattr(headline, 'title'):
+                    age = headline.age_minutes
+                    age_str = f" ({age:.0f}min ago)" if age is not None else ""
+                    pub_str = ""
+                    if headline.published_at:
+                        pub_str = f" [{headline.published_at.strftime('%H:%M UTC')}]"
+                    print(f"           {i+1}. {headline.title[:72]}{pub_str}{age_str}")
+                else:
+                    print(f"           {i+1}. {headline[:80]}")
         else:
             print(self._color("  News:    No matching headlines found", self.YELLOW))
 

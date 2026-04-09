@@ -80,7 +80,7 @@ class WatchdogConfig:
 
     # News
     news_check_enabled: bool = True
-    news_lookback_hours: float = 6.0
+    news_lookback_hours: float = 2.0  # Only match headlines from last 2h (was 6h)
 
     # Registry (reuse NegriskConfig defaults for discovery)
     registry_refresh_seconds: float = 60.0
@@ -99,6 +99,26 @@ class PriceSnapshot:
     bid_size: Optional[float] = None
     ask_size: Optional[float] = None
     source: str = "unknown"  # "clob_history", "clob", "websocket"
+
+
+@dataclass
+class NewsHeadline:
+    """A news headline with publication timestamp for temporal correlation."""
+    title: str
+    published_at: Optional[datetime] = None  # UTC; None = unknown pub time
+
+    @property
+    def age_minutes(self) -> Optional[float]:
+        """Minutes since publication (None if pub time unknown)."""
+        if self.published_at is None:
+            return None
+        return (datetime.utcnow() - self.published_at).total_seconds() / 60
+
+    def to_dict(self) -> dict:
+        return {
+            "title": self.title,
+            "published_at": self.published_at.isoformat() if self.published_at else None,
+        }
 
 
 @dataclass
@@ -130,7 +150,7 @@ class AnomalyAlert:
     # Fields with defaults
     direction: str = "up"    # "up" (buy-side) or "down" (sell-side)
     correlated_outcomes: int = 0  # >0 if detected via cross-market correlation
-    news_headlines: list[str] = field(default_factory=list)
+    news_headlines: list[NewsHeadline] = field(default_factory=list)
     news_driven: bool = False
     detected_at: datetime = field(default_factory=datetime.utcnow)
 
@@ -154,7 +174,7 @@ class AnomalyAlert:
             "suspicion_score": round(self.suspicion_score, 2),
             "is_off_hours": self.is_off_hours,
             "event_volume_24h": self.event_volume_24h,
-            "news_headlines": self.news_headlines,
+            "news_headlines": [h.to_dict() for h in self.news_headlines],
             "news_driven": self.news_driven,
             "detected_at": self.detected_at.isoformat(),
         }

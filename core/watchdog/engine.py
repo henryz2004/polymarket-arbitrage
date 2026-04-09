@@ -320,7 +320,16 @@ class WatchdogEngine:
         # Fetch news if enabled
         if self.config.news_check_enabled:
             try:
-                headlines = await self.news_checker.fetch_headlines(alert.event_title)
+                # Compute when the price move started: detected_at - window_seconds.
+                # Headlines must predate this to be plausible catalysts (not
+                # journalists reacting to the market move).
+                from datetime import timedelta
+                move_started_at = alert.detected_at - timedelta(seconds=alert.window_seconds)
+
+                headlines = await self.news_checker.fetch_headlines(
+                    alert.event_title,
+                    move_started_at=move_started_at,
+                )
                 alert.news_headlines = headlines
                 alert.news_driven = len(headlines) > 0
             except Exception as e:

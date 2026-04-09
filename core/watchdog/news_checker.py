@@ -7,6 +7,11 @@ whether a price spike has a public catalyst.
 
 No API key required — uses public RSS feed + stdlib XML parsing.
 
+Temporal correlation: headlines must have been published BEFORE
+the price move started (or within a small grace window) to count
+as a plausible catalyst. Headlines published after the move are
+likely journalists reacting to the market, not the cause.
+
 Relevance scoring: headlines must share at least MIN_KEYWORD_OVERLAP
 non-stopword keywords with the event title to count as "relevant."
 This prevents broad keyword matches (e.g. "brazil" + "election")
@@ -21,7 +26,7 @@ from xml.etree import ElementTree
 
 import httpx
 
-from core.watchdog.models import WatchdogConfig
+from core.watchdog.models import NewsHeadline, WatchdogConfig
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +51,12 @@ GOOGLE_NEWS_RSS = "https://news.google.com/rss/search"
 # for it to count as a relevant catalyst (prevents loose matches).
 MIN_KEYWORD_OVERLAP = 2
 
+# Grace window: allow headlines published up to this many minutes AFTER
+# the price move started. This accounts for:
+# 1. Google News indexing delay (headline exists but pubDate lags)
+# 2. Near-simultaneous publication (news breaks, traders react immediately)
+POST_MOVE_GRACE_MINUTES = 15
+
 
 class NewsChecker:
     """Fetches recent news headlines matching event keywords."""
@@ -69,20 +80,28 @@ class NewsChecker:
         if self._http_client:
             await self._http_client.aclose()
 
-    async def fetch_headlines(self, event_title: str) -> list[str]:
+    async def fetch_headlines(
+        self,
+        event_title: str,
+        move_started_at: Optional[datetime] = None,
+    ) -> list[NewsHeadline]:
         """
         Fetch recent news headlines related to an event title.
 
-        Only returns headlines that are *relevant* to the event — i.e.,
-        share at least MIN_KEYWORD_OVERLAP meaningful keywords with the
-        event title. This prevents broad matches from inflating
-        news_driven classifications.
+        Only returns headlines that:
+        1. Have a known publication timestamp (dateless headlines are rejected)
+        2. Were published within news_lookback_hours before the alert
+        3. Were published BEFORE the price move started (+ grace window)
+        4. Share at least MIN_KEYWORD_OVERLAP keywords with the event title
 
         Args:
             event_title: The market event title to search for.
+            move_started_at: UTC timestamp when the price move began.
+                If provided, headlines published after this time (+ grace)
+                are excluded as likely reactive, not causal.
 
         Returns:
-            List of relevant headline strings from the last news_lookback_hours.
+            List of relevant NewsHeadline objects, sorted newest-first.
         """
         if not self._http_client:
             return []
@@ -108,13 +127,13 @@ class NewsChecker:
                 logger.debug(f"Google News RSS returned {resp.status_code} for query: {query}")
                 return []
 
-            all_headlines = self._parse_rss(resp.text)
+            all_headlines = self._parse_rss(resp.text, move_started_at=move_started_at)
 
             # Filter to relevant headlines only
             keyword_set = set(keywords)
             relevant = []
             for headline in all_headlines:
-                if self._headline_relevance(headline, keyword_set) >= MIN_KEYWORD_OVERLAP:
+                if self._headline_relevance(headline.title, keyword_set) >= MIN_KEYWORD_OVERLAP:
                     relevant.append(headline)
 
             return relevant
@@ -153,11 +172,22 @@ class NewsChecker:
 
         return priority + rest
 
-    def _parse_rss(self, xml_text: str) -> list[str]:
+    def _parse_rss(
+        self,
+        xml_text: str,
+        move_started_at: Optional[datetime] = None,
+    ) -> list[NewsHeadline]:
         """
         Parse Google News RSS XML and return recent headlines.
 
-        Filters to articles published within news_lookback_hours.
+        Filters:
+        1. Rejects items with no pubDate (unknown provenance)
+        2. Rejects items older than news_lookback_hours
+        3. If move_started_at is provided, rejects items published after
+           the price move started (+ POST_MOVE_GRACE_MINUTES grace window)
+
+        Returns:
+            List of NewsHeadline objects sorted newest-first.
         """
         try:
             root = ElementTree.fromstring(xml_text)
@@ -165,8 +195,14 @@ class NewsChecker:
             logger.debug(f"RSS XML parse error: {e}")
             return []
 
-        headlines = []
-        cutoff = datetime.utcnow() - timedelta(hours=self.config.news_lookback_hours)
+        headlines: list[NewsHeadline] = []
+        now = datetime.utcnow()
+        lookback_cutoff = now - timedelta(hours=self.config.news_lookback_hours)
+
+        # If we know when the move started, headlines must predate it (+ grace)
+        move_cutoff: Optional[datetime] = None
+        if move_started_at is not None:
+            move_cutoff = move_started_at + timedelta(minutes=POST_MOVE_GRACE_MINUTES)
 
         # RSS structure: rss > channel > item
         channel = root.find("channel")
@@ -180,15 +216,33 @@ class NewsChecker:
             if title_elem is None or title_elem.text is None:
                 continue
 
-            headline = title_elem.text.strip()
+            headline_text = title_elem.text.strip()
 
-            # Filter by publication date if available
-            if pub_date_elem is not None and pub_date_elem.text:
-                pub_date = self._parse_rss_date(pub_date_elem.text)
-                if pub_date and pub_date < cutoff:
-                    continue
+            # Reject headlines with no publication date — unknown provenance.
+            # Without a timestamp we can't verify temporal correlation.
+            if pub_date_elem is None or not pub_date_elem.text:
+                continue
 
-            headlines.append(headline)
+            pub_date = self._parse_rss_date(pub_date_elem.text)
+            if pub_date is None:
+                continue  # Unparseable date format
+
+            # Filter: too old (outside lookback window)
+            if pub_date < lookback_cutoff:
+                continue
+
+            # Filter: published after the price move started (+ grace)
+            # These are likely journalists reacting to the market, not the cause.
+            if move_cutoff is not None and pub_date > move_cutoff:
+                continue
+
+            headlines.append(NewsHeadline(
+                title=headline_text,
+                published_at=pub_date,
+            ))
+
+        # Sort newest-first
+        headlines.sort(key=lambda h: h.published_at or now, reverse=True)
 
         return headlines[:10]  # Cap at 10 headlines
 
