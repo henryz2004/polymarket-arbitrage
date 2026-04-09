@@ -22,7 +22,6 @@ from core.watchdog.alert_dispatcher import (
     FileChannel,
 )
 from core.watchdog.engine import WatchdogEngine
-from core.watchdog.platforms.kalshi import KalshiWatchdogConfig, KalshiWatchdogEngine
 
 __all__ = [
     "WatchdogConfig",
@@ -39,3 +38,18 @@ __all__ = [
     "KalshiWatchdogConfig",
     "KalshiWatchdogEngine",
 ]
+
+
+def __getattr__(name: str):
+    if name in {"KalshiWatchdogConfig", "KalshiWatchdogEngine"}:
+        from core.watchdog.platforms.kalshi import (
+            KalshiWatchdogConfig,
+            KalshiWatchdogEngine,
+        )
+
+        exports = {
+            "KalshiWatchdogConfig": KalshiWatchdogConfig,
+            "KalshiWatchdogEngine": KalshiWatchdogEngine,
+        }
+        return exports[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
