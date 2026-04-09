@@ -176,6 +176,12 @@ class AnomalyDetector:
 
         pct_change and abs_change should be positive magnitudes regardless of direction.
         """
+        # Suppress late-stage unwind/reset noise from near-resolved markets.
+        # A move like 99.9c -> 50c is usually a resolution/book-state artifact,
+        # not an insider-style sell signal worth alerting on.
+        if direction == "down" and price_before >= self.config.resolution_price_ceiling:
+            return None
+
         # For downward spikes, use price_before as the "high baseline" for scoring
         # (a drop from 80c is more meaningful than from 10c)
         score_price_before = price_before if direction == "up" else price_now

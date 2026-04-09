@@ -27,6 +27,13 @@ from core.watchdog.models import AnomalyAlert
 logger = logging.getLogger(__name__)
 
 
+def _polymarket_event_url(slug: str) -> Optional[str]:
+    slug = (slug or "").strip()
+    if not slug:
+        return None
+    return f"https://polymarket.com/event/{slug}"
+
+
 class AlertChannel(ABC):
     """Base class for alert output channels."""
 
@@ -127,6 +134,10 @@ class ConsoleChannel(AlertChannel):
         else:
             print(self._color("  News:    No matching headlines found", self.YELLOW))
 
+        event_url = _polymarket_event_url(alert.event_slug)
+        if event_url:
+            print(f"  Link:    {event_url}")
+
         print(self._color(f"{'=' * 60}", header_color))
         print()
 
@@ -204,6 +215,7 @@ class DiscordWebhookChannel(AlertChannel):
         direction_label = "SELL-SIDE" if direction == "down" else "BUY-SIDE"
         catalyst_label = "NEWS-DRIVEN" if alert.news_driven else "UNEXPLAINED"
         color = 0xE74C3C if alert.suspicion_score >= 7 else 0xF1C40F if alert.suspicion_score >= 5 else 0x3498DB
+        event_url = _polymarket_event_url(alert.event_slug)
 
         description = (
             f"**Outcome:** {alert.outcome_name}\n"
@@ -227,12 +239,14 @@ class DiscordWebhookChannel(AlertChannel):
             "embeds": [
                 {
                     "title": f"Watchdog Alert [{alert.suspicion_score:.1f}/10]",
+                    "url": event_url,
                     "description": description,
                     "color": color,
                     "timestamp": alert.detected_at.replace(tzinfo=timezone.utc).isoformat(),
                     "fields": [
                         {"name": "Event", "value": alert.event_title[:1024] or "n/a", "inline": False},
                         {"name": "Slug", "value": alert.event_slug[:1024] or "n/a", "inline": False},
+                        {"name": "Market Link", "value": event_url or "n/a", "inline": False},
                     ],
                 }
             ]
