@@ -26,7 +26,7 @@ def _append_flag(forwarded: list[str], flag: str, value) -> None:
 
 
 def _run_polymarket_scan(config_path: str, user_args: list[str]) -> None:
-    import watchdog_runner as legacy_watchdog
+    from apps.watchdog import polymarket_runner
 
     defaults = load_cli_defaults(config_path)
     forwarded: list[str] = []
@@ -39,12 +39,12 @@ def _run_polymarket_scan(config_path: str, user_args: list[str]) -> None:
     if defaults.get("news_check_enabled") is False:
         forwarded.append("--no-news")
     forwarded.extend(user_args)
-    sys.argv = ["watchdog_runner.py", *forwarded]
-    asyncio.run(legacy_watchdog.main())
+    sys.argv = ["apps.watchdog.polymarket_runner", *forwarded]
+    asyncio.run(polymarket_runner.main())
 
 
 def _run_kalshi_scan(config_path: str, user_args: list[str]) -> None:
-    import kalshi_watchdog_runner as legacy_kalshi_watchdog
+    from apps.watchdog import kalshi_runner
 
     defaults = load_cli_defaults(config_path)
     forwarded: list[str] = []
@@ -63,15 +63,15 @@ def _run_kalshi_scan(config_path: str, user_args: list[str]) -> None:
     if defaults.get("no_ws"):
         forwarded.append("--no-ws")
     forwarded.extend(user_args)
-    sys.argv = ["kalshi_watchdog_runner.py", *forwarded]
-    asyncio.run(legacy_kalshi_watchdog.main())
+    sys.argv = ["apps.watchdog.kalshi_runner", *forwarded]
+    asyncio.run(kalshi_runner.main())
 
 
 def _run_backtest(user_args: list[str]) -> None:
-    import backtest_runner as legacy_backtest
+    from apps.watchdog import backtest
 
-    sys.argv = ["backtest_runner.py", *user_args]
-    asyncio.run(legacy_backtest.main())
+    sys.argv = ["apps.watchdog.backtest", *user_args]
+    asyncio.run(backtest.main())
 
 
 def main() -> None:

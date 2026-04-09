@@ -52,12 +52,17 @@ services:
       - TZ=UTC
       # Webhook for alerts (set in .env or override)
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-}
-    command: >
-      --edge 0.5
-      --staleness 300
-      --gamma-legs 2
-      --record
-      --duration 720
+    command:
+      - long-test
+      - --edge
+      - "0.5"
+      - --staleness
+      - "300"
+      - --gamma-legs
+      - "2"
+      - --record
+      - --duration
+      - "720"
     volumes:
       - ./logs:/app/logs
       - ./config.yaml:/app/config.yaml:ro
@@ -77,18 +82,26 @@ services:
       - POLYMARKET_PRIVATE_KEY=${POLYMARKET_PRIVATE_KEY}
       - POLYMARKET_FUNDER=${POLYMARKET_FUNDER}
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-}
-    command: >
-      --edge 0.3
-      --staleness 15
-      --gamma-legs 2
-      --min-liquidity 25
-      --min-volume 1000
-      --record
-      --duration 720
-      --execute
-      --dry-run
-      --max-size 50
-      --ws-only
+    command:
+      - long-test
+      - --edge
+      - "0.3"
+      - --staleness
+      - "15"
+      - --gamma-legs
+      - "2"
+      - --min-liquidity
+      - "25"
+      - --min-volume
+      - "1000"
+      - --record
+      - --duration
+      - "720"
+      - --execute
+      - --dry-run
+      - --max-size
+      - "50"
+      - --ws-only
     volumes:
       - ./logs:/app/logs
       - ./config.yaml:/app/config.yaml:ro
@@ -108,17 +121,25 @@ services:
       - POLYMARKET_PRIVATE_KEY=${POLYMARKET_PRIVATE_KEY}
       - POLYMARKET_FUNDER=${POLYMARKET_FUNDER}
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-}
-    command: >
-      --edge 0.5
-      --staleness 10
-      --gamma-legs 0
-      --min-liquidity 25
-      --min-volume 1000
-      --record
-      --duration 720
-      --execute
-      --max-size 10
-      --ws-only
+    command:
+      - long-test
+      - --edge
+      - "0.5"
+      - --staleness
+      - "10"
+      - --gamma-legs
+      - "0"
+      - --min-liquidity
+      - "25"
+      - --min-volume
+      - "1000"
+      - --record
+      - --duration
+      - "720"
+      - --execute
+      - --max-size
+      - "10"
+      - --ws-only
     volumes:
       - ./logs:/app/logs
       - ./config.yaml:/app/config.yaml:ro

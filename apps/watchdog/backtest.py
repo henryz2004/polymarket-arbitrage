@@ -8,22 +8,22 @@ to verify it would have caught known insider trading events.
 
 Usage:
     # Run all built-in Iran scenarios
-    python backtest_runner.py
+    python -m apps.watchdog backtest
 
     # Run specific scenario by name
-    python backtest_runner.py --scenario "Iran strike"
+    python -m apps.watchdog backtest --scenario "Iran strike"
 
     # Run against a custom slug
-    python backtest_runner.py --slug us-x-iran-ceasefire-by --start 2026-03-01 --end 2026-03-15
+    python -m apps.watchdog backtest --slug us-x-iran-ceasefire-by --start 2026-03-01 --end 2026-03-15
 
     # Use cached data (no API calls after first run)
-    python backtest_runner.py --cache
+    python -m apps.watchdog backtest --cache
 
     # Save results to JSONL
-    python backtest_runner.py --output results.jsonl
+    python -m apps.watchdog backtest --output results.jsonl
 
     # Custom thresholds (tune sensitivity)
-    python backtest_runner.py --abs-threshold "0.03,1800" --rel-threshold "0.30,3600"
+    python -m apps.watchdog backtest --abs-threshold "0.03,1800" --rel-threshold "0.30,3600"
 """
 
 import argparse
@@ -127,11 +127,11 @@ async def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python backtest_runner.py                       # All Iran scenarios
-  python backtest_runner.py --scenario "strike"   # Filter scenarios by name
-  python backtest_runner.py --slug my-event-slug  # Custom slug
-  python backtest_runner.py --cache               # Use cached API data
-  python backtest_runner.py -v                    # Verbose output
+  python -m apps.watchdog backtest                       # All Iran scenarios
+  python -m apps.watchdog backtest --scenario "strike"   # Filter scenarios by name
+  python -m apps.watchdog backtest --slug my-event-slug  # Custom slug
+  python -m apps.watchdog backtest --cache               # Use cached API data
+  python -m apps.watchdog backtest -v                    # Verbose output
         """,
     )
 
@@ -262,8 +262,4 @@ Examples:
 
 
 if __name__ == "__main__":
-    print(
-        "DEPRECATED: use `python -m apps.watchdog backtest` instead.",
-        file=sys.stderr,
-    )
     asyncio.run(main())

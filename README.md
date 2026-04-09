@@ -57,15 +57,6 @@ tests/
 - [Watchdog guide](/Users/henryz2004/code/negrisk/polymarket-arbitrage/docs/watchdog.md)
 - [Negrisk long-run testing](/Users/henryz2004/code/negrisk/polymarket-arbitrage/docs/negrisk_testing.md)
 
-## Compatibility
+## Interface
 
-The historical root scripts still work for one migration phase, but they print deprecation notices:
-
-- `main.py`
-- `run_with_dashboard.py`
-- `negrisk_long_test.py`
-- `watchdog_runner.py`
-- `kalshi_watchdog_runner.py`
-- `backtest_runner.py`
-
-The recommended surface is the `python -m apps...` commands above.
+The supported surface is the `python -m apps...` command set above.

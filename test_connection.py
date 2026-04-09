@@ -107,7 +107,7 @@ async def test_connection(config_path: str = "config.live.yaml"):
     print()
     print("Next steps:")
     print("1. Review config.live.yaml settings")
-    print("2. Start with: python3 run_with_dashboard.py -c config.live.yaml")
+    print("2. Start with: python3 -m apps.negrisk dashboard -c config.live.yaml")
     print("3. Monitor closely on the dashboard")
     print()
     
@@ -127,4 +127,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

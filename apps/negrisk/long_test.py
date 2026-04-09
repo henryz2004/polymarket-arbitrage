@@ -14,7 +14,7 @@ Logs:
 - Performance metrics
 
 Usage:
-    python negrisk_long_test.py [--duration HOURS] [--edge PERCENT]
+    python -m apps.negrisk long-test [--duration HOURS] [--edge PERCENT]
 
     --duration: How many hours to run (default: 4)
     --edge: Minimum net edge percentage (default: 1.5)
@@ -930,8 +930,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    print(
-        "DEPRECATED: use `python -m apps.negrisk long-test` instead.",
-        file=sys.stderr,
-    )
     asyncio.run(main())

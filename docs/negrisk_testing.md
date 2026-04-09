@@ -11,10 +11,10 @@ Run two parallel tests overnight to compare edge thresholds:
 mkdir -p logs/negrisk
 
 # Conservative test (1.5% edge, 12 hours)
-nohup python negrisk_long_test.py --duration 12 --edge 1.5 > /dev/null 2>&1 &
+nohup python -m apps.negrisk long-test --duration 12 --edge 1.5 > /dev/null 2>&1 &
 
 # Aggressive test (0.8% edge, 12 hours)
-nohup python negrisk_long_test.py --duration 12 --edge 0.8 > /dev/null 2>&1 &
+nohup python -m apps.negrisk long-test --duration 12 --edge 0.8 > /dev/null 2>&1 &
 
 # Verify both are running
 jobs -l
@@ -37,22 +37,22 @@ for f in logs/negrisk/stats_*.jsonl; do echo "=== $f ===" && tail -1 "$f" | jq '
 
 ### Run a 4-hour test (default):
 ```bash
-python negrisk_long_test.py
+python -m apps.negrisk long-test
 ```
 
 ### Run an 8-hour overnight test:
 ```bash
-python negrisk_long_test.py --duration 8
+python -m apps.negrisk long-test --duration 8
 ```
 
 ### Run with lower edge threshold (0.8%):
 ```bash
-python negrisk_long_test.py --duration 4 --edge 0.8
+python -m apps.negrisk long-test --duration 4 --edge 0.8
 ```
 
 ### Run in background:
 ```bash
-nohup python negrisk_long_test.py --duration 12 > /dev/null 2>&1 &
+nohup python -m apps.negrisk long-test --duration 12 > /dev/null 2>&1 &
 ```
 
 ### Watch logs in real-time:
@@ -113,7 +113,7 @@ JSON Lines file with stats snapshots every 5 minutes:
 
 ## Configuration
 
-The test uses these parameters (from `negrisk_long_test.py`):
+The test uses these parameters (from `apps/negrisk/long_test.py`):
 
 ```python
 NegriskConfig(
@@ -263,38 +263,38 @@ echo "Aggressive (0.8%):" && wc -l logs/negrisk/opportunities_*_0.8_*.jsonl 2>/d
 
 ### 1. Baseline Test (4 hours, 1.5% edge):
 ```bash
-python negrisk_long_test.py --duration 4 --edge 1.5
+python -m apps.negrisk long-test --duration 4 --edge 1.5
 ```
 Good for: Verifying system stability, checking if opportunities exist
 
 ### 2. Aggressive Test (2 hours, 0.8% edge):
 ```bash
-python negrisk_long_test.py --duration 2 --edge 0.8
+python -m apps.negrisk long-test --duration 2 --edge 0.8
 ```
 Good for: Seeing more opportunities, testing detection logic
 
 ### 3. Overnight Test (12 hours, 1.5% edge):
 ```bash
-python negrisk_long_test.py --duration 12 --edge 1.5
+python -m apps.negrisk long-test --duration 12 --edge 1.5
 ```
 Good for: Stability testing, catching market events across time zones
 
 ### 4. Production Simulation (8 hours, 2.5% edge):
 ```bash
-python negrisk_long_test.py --duration 8 --edge 2.5
+python -m apps.negrisk long-test --duration 8 --edge 2.5
 ```
 Good for: Simulating production parameters from roadmap
 
 ### 5. Parallel Overnight (12 hours, two thresholds):
 ```bash
-nohup python negrisk_long_test.py --duration 12 --edge 1.5 > /dev/null 2>&1 &
-nohup python negrisk_long_test.py --duration 12 --edge 0.8 > /dev/null 2>&1 &
+nohup python -m apps.negrisk long-test --duration 12 --edge 1.5 > /dev/null 2>&1 &
+nohup python -m apps.negrisk long-test --duration 12 --edge 0.8 > /dev/null 2>&1 &
 ```
 Good for: Understanding edge sensitivity, comparing opportunity frequency across thresholds
 
 ### 6. Wide-open scan (24 hours, 0% edge):
 ```bash
-nohup python negrisk_long_test.py --duration 24 --edge 0.0 > /dev/null 2>&1 &
+nohup python -m apps.negrisk long-test --duration 24 --edge 0.0 > /dev/null 2>&1 &
 ```
 Good for: Seeing ALL opportunities regardless of edge, understanding the full opportunity landscape
 

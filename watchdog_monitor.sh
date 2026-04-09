@@ -108,7 +108,7 @@ restart_watchdog() {
     # Start fresh
     local logfile="logs/watchdog/watchdog_$(date +%Y%m%d_%H%M%S).log"
     tmux new-session -d -s watchdog \
-        "PYTHONUNBUFFERED=1 caffeinate -i $PYTHON watchdog_runner.py --duration 87600 2>&1 | tee $logfile"
+        "PYTHONUNBUFFERED=1 caffeinate -i $PYTHON -m apps.watchdog scan --platform polymarket --duration 87600 2>&1 | tee $logfile"
 
     log "Waiting 90s for watchdog startup..."
     sleep 90

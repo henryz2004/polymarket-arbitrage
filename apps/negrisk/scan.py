@@ -6,10 +6,10 @@ Polymarket Arbitrage Trading Bot
 Main entry point for the trading bot.
 
 Usage:
-    python main.py                      # Run in dry-run mode (default)
-    python main.py --live               # Run in live mode
-    python main.py --backtest           # Run backtest
-    python main.py --config my.yaml     # Use custom config file
+    python -m apps.negrisk scan                      # Run in dry-run mode (default)
+    python -m apps.negrisk scan --live               # Run in live mode
+    python -m apps.negrisk scan --backtest           # Run backtest
+    python -m apps.negrisk scan --config my.yaml     # Use custom config file
 """
 
 import argparse
@@ -402,10 +402,10 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python main.py                    Run in dry-run mode
-  python main.py --live             Run in live trading mode
-  python main.py --backtest         Run backtest simulation
-  python main.py -c custom.yaml     Use custom config file
+  python -m apps.negrisk scan                    Run in dry-run mode
+  python -m apps.negrisk scan --live             Run in live trading mode
+  python -m apps.negrisk scan --backtest         Run backtest simulation
+  python -m apps.negrisk scan -c custom.yaml     Use custom config file
         """
     )
     
@@ -461,8 +461,4 @@ Examples:
 
 
 if __name__ == "__main__":
-    print(
-        "DEPRECATED: use `python -m apps.negrisk scan` instead.",
-        file=sys.stderr,
-    )
     main()

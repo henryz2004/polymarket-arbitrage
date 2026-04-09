@@ -10,7 +10,7 @@ watchdog, adapted for Kalshi's market structure and API.
 Requires Kalshi API credentials for WebSocket access.
 
 Usage:
-    python kalshi_watchdog_runner.py [--duration HOURS] [--keywords KEYWORDS]
+    python -m apps.watchdog scan --platform kalshi [--duration HOURS] [--keywords KEYWORDS]
                                      [--min-volume COUNT]
 
 Environment Variables:
@@ -20,17 +20,17 @@ Environment Variables:
 
 Examples:
     # Run for 24 hours with defaults (geopolitical keywords)
-    python kalshi_watchdog_runner.py
+    python -m apps.watchdog scan --platform kalshi
 
     # Run for 1 hour, lower volume threshold
-    python kalshi_watchdog_runner.py --duration 1 --min-volume 1000
+    python -m apps.watchdog scan --platform kalshi --duration 1 --min-volume 1000
 
     # Custom keywords
-    python kalshi_watchdog_runner.py --keywords "iran,strike,nuclear,sanctions"
+    python -m apps.watchdog scan --platform kalshi --keywords "iran,strike,nuclear,sanctions"
 
     # Run in tmux (recommended for long runs)
     tmux new-session -d -s kalshi-watchdog \\
-        "caffeinate -i python3 -u kalshi_watchdog_runner.py --duration 24"
+        "caffeinate -i python3 -u -m apps.watchdog scan --platform kalshi --duration 24"
 """
 
 import argparse
@@ -278,10 +278,10 @@ async def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python kalshi_watchdog_runner.py --duration 24
-  python kalshi_watchdog_runner.py --duration 1 --min-volume 1000
-  python kalshi_watchdog_runner.py --keywords "iran,strike,nuclear"
-  python kalshi_watchdog_runner.py --watch-events "KXIRAN-26APR01"
+  python -m apps.watchdog scan --platform kalshi --duration 24
+  python -m apps.watchdog scan --platform kalshi --duration 1 --min-volume 1000
+  python -m apps.watchdog scan --platform kalshi --keywords "iran,strike,nuclear"
+  python -m apps.watchdog scan --platform kalshi --watch-events "KXIRAN-26APR01"
         """
     )
     parser.add_argument('--duration', type=float, default=24.0,
@@ -380,8 +380,4 @@ Examples:
 
 
 if __name__ == "__main__":
-    print(
-        "DEPRECATED: use `python -m apps.watchdog scan --platform kalshi` instead.",
-        file=sys.stderr,
-    )
     asyncio.run(main())

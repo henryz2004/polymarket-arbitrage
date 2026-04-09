@@ -26,12 +26,6 @@ COPY utils/ utils/
 COPY dashboard/ dashboard/
 COPY config/ config/
 COPY config.yaml .
-COPY watchdog_runner.py .
-COPY kalshi_watchdog_runner.py .
-COPY backtest_runner.py .
-COPY negrisk_long_test.py .
-COPY main.py .
-COPY run_with_dashboard.py .
 
 # Create non-root user for security
 RUN groupadd -r negrisk && useradd -r -g negrisk -d /app negrisk \
@@ -44,7 +38,6 @@ USER negrisk
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 \
     CMD python -c "from core.negrisk.engine import NegriskEngine; from pathlib import Path; assert Path('logs/negrisk').exists(); print('ok')" || exit 1
 
-# Default: run the negrisk scanner
-# Override CMD in docker-compose for different configurations
-ENTRYPOINT ["python", "-u", "negrisk_long_test.py"]
-CMD ["--edge", "0.5", "--staleness", "300", "--gamma-legs", "2", "--record", "--duration", "720"]
+# Default: run the negrisk app
+ENTRYPOINT ["python", "-u", "-m", "apps.negrisk"]
+CMD ["long-test", "--edge", "0.5", "--staleness", "300", "--gamma-legs", "2", "--record", "--duration", "720"]

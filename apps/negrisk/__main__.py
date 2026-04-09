@@ -9,25 +9,25 @@ import asyncio
 import sys
 
 
-def _run_legacy_main(argv: list[str]) -> None:
-    import main as legacy_main
+def _run_scan(argv: list[str]) -> None:
+    from apps.negrisk import scan
 
-    sys.argv = ["main.py", *argv]
-    legacy_main.main()
-
-
-def _run_legacy_dashboard(argv: list[str]) -> None:
-    import run_with_dashboard as legacy_dashboard
-
-    sys.argv = ["run_with_dashboard.py", *argv]
-    legacy_dashboard.main()
+    sys.argv = ["apps.negrisk.scan", *argv]
+    scan.main()
 
 
-def _run_legacy_long_test(argv: list[str]) -> None:
-    import negrisk_long_test as legacy_long_test
+def _run_dashboard(argv: list[str]) -> None:
+    from apps.negrisk import dashboard
 
-    sys.argv = ["negrisk_long_test.py", *argv]
-    asyncio.run(legacy_long_test.main())
+    sys.argv = ["apps.negrisk.dashboard", *argv]
+    dashboard.main()
+
+
+def _run_long_test(argv: list[str]) -> None:
+    from apps.negrisk import long_test
+
+    sys.argv = ["apps.negrisk.long_test", *argv]
+    asyncio.run(long_test.main())
 
 
 def main() -> None:
@@ -66,7 +66,7 @@ def main() -> None:
             forwarded.extend(["--backtest-duration", str(args.backtest_duration)])
         if args.verbose:
             forwarded.append("-v")
-        _run_legacy_main(forwarded)
+        _run_scan(forwarded)
         return
 
     if args.command == "dashboard":
@@ -77,10 +77,10 @@ def main() -> None:
             forwarded.append("--dry-run")
         if args.verbose:
             forwarded.append("-v")
-        _run_legacy_dashboard(forwarded)
+        _run_dashboard(forwarded)
         return
 
-    _run_legacy_long_test(args.args)
+    _run_long_test(args.args)
 
 
 if __name__ == "__main__":

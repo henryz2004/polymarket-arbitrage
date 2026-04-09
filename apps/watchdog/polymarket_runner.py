@@ -9,21 +9,21 @@ insider-trading pattern: price jumped 2.5x (7c->25.5c) 21 hours before
 any public news, during off-hours (2:15 AM PST).
 
 Usage:
-    python watchdog_runner.py [--duration HOURS] [--keywords KEYWORDS]
+    python -m apps.watchdog scan --platform polymarket [--duration HOURS] [--keywords KEYWORDS]
                                [--watch-slugs SLUGS] [--min-volume USD]
 
 Examples:
     # Run for 24 hours with defaults (geopolitical keywords)
-    python watchdog_runner.py
+    python -m apps.watchdog scan --platform polymarket
 
     # Run for 1 hour, lower volume threshold
-    python watchdog_runner.py --duration 1 --min-volume 5000
+    python -m apps.watchdog scan --platform polymarket --duration 1 --min-volume 5000
 
     # Watch specific slugs
-    python watchdog_runner.py --watch-slugs "us-strikes-iran,china-invades-taiwan"
+    python -m apps.watchdog scan --platform polymarket --watch-slugs "us-strikes-iran,china-invades-taiwan"
 
     # Custom keywords
-    python watchdog_runner.py --keywords "iran,strike,nuclear,sanctions"
+    python -m apps.watchdog scan --platform polymarket --keywords "iran,strike,nuclear,sanctions"
 """
 
 import argparse
@@ -262,10 +262,10 @@ async def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python watchdog_runner.py --duration 24
-  python watchdog_runner.py --duration 1 --min-volume 5000
-  python watchdog_runner.py --keywords "iran,strike,nuclear"
-  python watchdog_runner.py --watch-slugs "us-strikes-iran"
+  python -m apps.watchdog scan --platform polymarket --duration 24
+  python -m apps.watchdog scan --platform polymarket --duration 1 --min-volume 5000
+  python -m apps.watchdog scan --platform polymarket --keywords "iran,strike,nuclear"
+  python -m apps.watchdog scan --platform polymarket --watch-slugs "us-strikes-iran"
         """
     )
     parser.add_argument('--duration', type=float, default=24.0,
@@ -318,8 +318,4 @@ Examples:
 
 
 if __name__ == "__main__":
-    print(
-        "DEPRECATED: use `python -m apps.watchdog scan --platform polymarket` instead.",
-        file=sys.stderr,
-    )
     asyncio.run(main())

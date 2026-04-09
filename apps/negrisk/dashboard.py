@@ -7,9 +7,9 @@ Starts the trading bot and web dashboard together.
 Supports cross-platform arbitrage between Polymarket and Kalshi.
 
 Usage:
-    python run_with_dashboard.py              # Dry run mode
-    python run_with_dashboard.py --live       # Live mode
-    python run_with_dashboard.py --port 8080  # Custom port
+    python -m apps.negrisk dashboard              # Dry run mode
+    python -m apps.negrisk dashboard --live       # Live mode
+    python -m apps.negrisk dashboard --port 8080  # Custom port
 """
 
 import argparse
@@ -531,8 +531,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    print(
-        "DEPRECATED: use `python -m apps.negrisk dashboard` instead.",
-        file=sys.stderr,
-    )
     main()
