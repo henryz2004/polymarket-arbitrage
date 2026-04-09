@@ -1,0 +1,1 @@
+"""Negrisk app CLI package."""

@@ -17,6 +17,32 @@
 #   docker compose down
 
 services:
+  kalshi-watchdog:
+    build: .
+    container_name: kalshi-watchdog
+    restart: unless-stopped
+    environment:
+      - TZ=UTC
+      - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-}
+      - KALSHI_API_KEY=${KALSHI_API_KEY:-}
+      - KALSHI_PRIVATE_KEY=${KALSHI_PRIVATE_KEY:-}
+      - KALSHI_PRIVATE_KEY_PATH=${KALSHI_PRIVATE_KEY_PATH:-}
+    entrypoint: ["python", "-u", "-m", "apps.watchdog"]
+    command:
+      - scan
+      - --platform
+      - kalshi
+      - --config
+      - config/watchdog.kalshi.yaml
+    volumes:
+      - ./logs:/app/logs
+      - ./config:/app/config:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
   # Scanner-only: detect opportunities, collect backtesting data
   negrisk-scanner:
     build: .

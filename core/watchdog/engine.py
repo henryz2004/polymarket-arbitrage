@@ -5,8 +5,8 @@ Watchdog Engine
 Main orchestrator for suspicious activity detection.
 
 Coordinates:
-1. NegriskRegistry — discovers events from Gamma API
-2. BBATracker — real-time WebSocket prices
+1. Polymarket provider — discovers events from Gamma API
+2. BBA tracker — real-time WebSocket prices
 3. PriceTracker — rolling price history
 4. AnomalyDetector — spike detection + suspicion scoring
 5. NewsChecker — Google News RSS headlines
@@ -18,13 +18,17 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from core.negrisk.bba_tracker import BBATracker
-from core.negrisk.models import NegriskConfig, NegriskEvent
-from core.negrisk.registry import NegriskRegistry
-from core.watchdog.alert_dispatcher import AlertDispatcher, ConsoleChannel, FileChannel
+from core.shared.markets.models import MarketEvent
+from core.watchdog.alert_dispatcher import (
+    AlertDispatcher,
+    ConsoleChannel,
+    DiscordWebhookChannel,
+    FileChannel,
+)
 from core.watchdog.anomaly_detector import AnomalyDetector
 from core.watchdog.models import WatchdogConfig
 from core.watchdog.news_checker import NewsChecker
+from core.watchdog.platforms.polymarket import PolymarketWatchdogMarketData
 from core.watchdog.price_tracker import PriceTracker
 
 logger = logging.getLogger(__name__)
@@ -45,28 +49,24 @@ class WatchdogEngine:
     def __init__(self, config: WatchdogConfig):
         self.config = config
 
-        # Build a NegriskConfig for the registry + tracker
-        self._negrisk_config = NegriskConfig(
+        self.market_data = PolymarketWatchdogMarketData(
             min_outcomes=config.min_outcomes,
             min_event_volume_24h=config.min_event_volume_24h,
             registry_refresh_seconds=config.registry_refresh_seconds,
             bba_ws_reconnect_delay=config.bba_ws_reconnect_delay,
             staleness_ttl_ms=config.staleness_ttl_ms,
-            # Relaxed settings — we're watching, not trading
-            min_liquidity_per_outcome=0.0,
-            min_net_edge=0.0,
-            # Watchdog mode: discover ALL events (not just neg-risk) so we
-            # can monitor non-neg-risk multi-outcome markets like Iran ceasefire
-            watchdog_mode=True,
         )
 
-        # Core components — own instances
-        self.registry = NegriskRegistry(self._negrisk_config)
-        self.tracker: Optional[BBATracker] = None
+        self.registry = self.market_data.registry
+        self.tracker = None
         self.price_tracker = PriceTracker(config)
         self.detector = AnomalyDetector(config)
         self.news_checker = NewsChecker(config)
-        self.dispatcher = AlertDispatcher([ConsoleChannel(), FileChannel()])
+        channels = [ConsoleChannel(), FileChannel()]
+        discord_channel = DiscordWebhookChannel.from_env()
+        if discord_channel:
+            channels.append(discord_channel)
+        self.dispatcher = AlertDispatcher(channels)
 
         # Background tasks
         self._scan_task: Optional[asyncio.Task] = None
@@ -110,9 +110,7 @@ class WatchdogEngine:
         # Use token_filter to only subscribe to watched tokens (not all registry
         # tokens). In watchdog_mode the registry discovers ALL events, which can
         # be 10K+ tokens — subscribing to all causes WS keepalive timeouts.
-        self.tracker = BBATracker(
-            registry=self.registry,
-            config=self._negrisk_config,
+        self.tracker = self.market_data.build_tracker(
             on_price_update=self._on_price_update,
             token_filter=lambda: list(self.price_tracker.get_watched_markets().keys()),
         )
@@ -209,7 +207,7 @@ class WatchdogEngine:
 
         return len(active_token_ids)
 
-    def _should_watch(self, event: NegriskEvent) -> bool:
+    def _should_watch(self, event: MarketEvent) -> bool:
         """Check if an event matches watch criteria."""
         # Force-watch by slug
         if self.config.watch_slugs:

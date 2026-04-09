@@ -18,12 +18,17 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
+COPY apps/ apps/
 COPY core/ core/
 COPY polymarket_client/ polymarket_client/
 COPY kalshi_client/ kalshi_client/
 COPY utils/ utils/
 COPY dashboard/ dashboard/
+COPY config/ config/
 COPY config.yaml .
+COPY watchdog_runner.py .
+COPY kalshi_watchdog_runner.py .
+COPY backtest_runner.py .
 COPY negrisk_long_test.py .
 COPY main.py .
 COPY run_with_dashboard.py .

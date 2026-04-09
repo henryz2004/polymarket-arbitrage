@@ -16,8 +16,8 @@ from typing import Optional
 
 import httpx
 
+from core.shared.markets.models import MarketEvent, Outcome
 from core.watchdog.models import PriceSnapshot, WatchdogConfig
-from core.negrisk.models import NegriskEvent, Outcome
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +84,7 @@ class PriceTracker:
         if self._http_client:
             await self._http_client.aclose()
 
-    def add_watch(self, event: NegriskEvent, outcome: Outcome) -> None:
+    def add_watch(self, event: MarketEvent, outcome: Outcome) -> None:
         """Add an outcome to the watch list."""
         if outcome.token_id in self._markets:
             return

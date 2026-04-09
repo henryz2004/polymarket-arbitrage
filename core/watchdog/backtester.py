@@ -265,6 +265,10 @@ class WatchdogBacktester:
 
             # Inject snapshot into the market's history
             wm.history.append(snapshot)
+            # Replay should mimic production sampling, where live snapshots are
+            # also available to window-based anomaly checks.
+            if snapshot.source not in ("clob_history", "gamma"):
+                wm.live_history.append(snapshot)
 
             # Run detection scan at configured intervals
             current_time = snapshot.timestamp
@@ -551,6 +555,8 @@ class WatchdogBacktester:
                 continue
 
             wm.history.append(snapshot)
+            if snapshot.source not in ("clob_history", "gamma"):
+                wm.live_history.append(snapshot)
 
             current_time = snapshot.timestamp
             should_scan = (

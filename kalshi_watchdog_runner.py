@@ -44,8 +44,8 @@ from pathlib import Path
 from typing import Optional
 
 from kalshi_client.auth import KalshiAuth
-from core.watchdog_kalshi.engine import KalshiWatchdogEngine
-from core.watchdog_kalshi.models import KalshiWatchdogConfig
+from core.watchdog.platforms.kalshi.engine import KalshiWatchdogEngine
+from core.watchdog.platforms.kalshi.models import KalshiWatchdogConfig
 
 
 class DetailedFormatter(logging.Formatter):
@@ -380,4 +380,8 @@ Examples:
 
 
 if __name__ == "__main__":
+    print(
+        "DEPRECATED: use `python -m apps.watchdog scan --platform kalshi` instead.",
+        file=sys.stderr,
+    )
     asyncio.run(main())

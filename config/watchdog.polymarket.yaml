@@ -1,0 +1,16 @@
+duration: 24
+keywords:
+  - strike
+  - war
+  - attack
+  - sanctions
+  - invasion
+  - military
+watch_slugs:
+  - us-x-iran-ceasefire-by
+  - us-forces-enter-iran-by
+  - usisrael-strikes-iran-by
+min_volume: 10000
+poll_interval: 60
+cooldown: 300
+news_check_enabled: true

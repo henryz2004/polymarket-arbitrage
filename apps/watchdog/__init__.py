@@ -1,0 +1,1 @@
+"""Watchdog app CLI package."""

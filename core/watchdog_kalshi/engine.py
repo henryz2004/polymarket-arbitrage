@@ -26,7 +26,12 @@ from kalshi_client.auth import KalshiAuth
 from kalshi_client.models import KalshiTickerUpdate, KalshiTrade
 from kalshi_client.websocket import KalshiWebSocket
 
-from core.watchdog.alert_dispatcher import AlertDispatcher, ConsoleChannel, FileChannel
+from core.watchdog.alert_dispatcher import (
+    AlertDispatcher,
+    ConsoleChannel,
+    DiscordWebhookChannel,
+    FileChannel,
+)
 from core.watchdog.anomaly_detector import AnomalyDetector
 from core.watchdog.news_checker import NewsChecker
 
@@ -61,10 +66,14 @@ class KalshiWatchdogEngine:
         self.price_tracker = KalshiPriceTracker(config, self._client)
         self.detector = AnomalyDetector(config)
         self.news_checker = NewsChecker(config)
-        self.dispatcher = AlertDispatcher([
+        channels = [
             ConsoleChannel(),
             FileChannel(log_dir=Path("logs/watchdog_kalshi")),
-        ])
+        ]
+        discord_channel = DiscordWebhookChannel.from_env()
+        if discord_channel:
+            channels.append(discord_channel)
+        self.dispatcher = AlertDispatcher(channels)
 
         # WebSocket (requires auth)
         self._ws: Optional[KalshiWebSocket] = None

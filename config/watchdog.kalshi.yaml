@@ -1,0 +1,18 @@
+duration: 24
+keywords:
+  - strike
+  - war
+  - attack
+  - sanctions
+watch_events: []
+watch_series: []
+categories:
+  - politics
+  - world
+  - geopolitics
+min_volume: 5000
+poll_interval: 60
+cooldown: 300
+news_check_enabled: true
+demo: false
+no_ws: false

@@ -930,4 +930,8 @@ async def main():
 
 
 if __name__ == "__main__":
+    print(
+        "DEPRECATED: use `python -m apps.negrisk long-test` instead.",
+        file=sys.stderr,
+    )
     asyncio.run(main())

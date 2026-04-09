@@ -10,20 +10,14 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
-
-@dataclass
-class PriceLevel:
-    """A single price level in the order book."""
-    price: float
-    size: float
-
-
-class OutcomeStatus(Enum):
-    """Status of an outcome in a neg-risk event."""
-    ACTIVE = "active"           # Normal tradeable outcome
-    PLACEHOLDER = "placeholder"  # Unnamed placeholder (augmented neg-risk)
-    OTHER = "other"             # "Other" category
-    RESOLVED = "resolved"       # Already resolved
+from core.shared.markets.models import (
+    MarketDataConfig,
+    MarketEvent,
+    Outcome,
+    OutcomeBBA,
+    OutcomeStatus,
+    PriceLevel,
+)
 
 
 class ArbDirection(Enum):
@@ -37,19 +31,13 @@ class ArbDirection(Enum):
 
 
 @dataclass
-class NegriskConfig:
+class NegriskConfig(MarketDataConfig):
     """Configuration for neg-risk arbitrage detection and execution."""
 
     # Detection parameters
     min_net_edge: float = 0.015          # 1.5% minimum NET edge (after fees & gas)
     min_outcomes: int = 3                 # Minimum outcomes for neg-risk event
     max_legs: int = 15                    # Maximum outcomes to trade
-
-    # Staleness parameters
-    staleness_ttl_ms: float = 5000.0      # 5 seconds max staleness (default)
-    staleness_ttl_relaxed_ms: float = 15000.0  # 15s for low-volatility events
-    staleness_ttl_strict_ms: float = 3000.0    # 3s for high-volatility events (crypto)
-    ws_sequence_gap_threshold: int = 5    # Max allowed sequence gaps
 
     # Fee parameters (Polymarket)
     # fee_rate_bps: The feeRateBps value from the CLOB API.
@@ -106,261 +94,12 @@ class NegriskConfig:
     # CLOB re-seeding
     reseed_interval_seconds: float = 300.0  # Re-seed gamma-only tokens every 5 minutes
 
-    # Event horizon filter
-    max_horizon_days: float = 0            # Max days until resolution (0 = no limit)
-
     # Event prioritization
     prioritize_near_resolution: bool = True
     resolution_window_hours: float = 24.0      # Events resolving within this window get priority
     priority_edge_discount: float = 0.5        # Multiply min_net_edge by this for high-priority events
     volume_spike_threshold: float = 2.0        # 2x average volume = spike
-
-    # Watchdog mode: fetch ALL events from Gamma API (not just neg-risk)
-    # This allows the watchdog to discover non-neg-risk multi-outcome events
-    # like "US x Iran ceasefire by...?" that have significant insider trading signals
-    watchdog_mode: bool = False
-
-
-@dataclass
-class OutcomeBBA:
-    """Best Bid/Ask for a single outcome."""
-    best_bid: Optional[float] = None
-    best_ask: Optional[float] = None
-    bid_size: Optional[float] = None
-    ask_size: Optional[float] = None
-    last_updated: datetime = field(default_factory=datetime.utcnow)
-    sequence_id: Optional[int] = None
-    source: str = "unknown"  # "gamma", "clob", "websocket" — tracks data provenance
-
-    # Full order book depth
-    ask_levels: list = field(default_factory=list)  # list[PriceLevel], full ask depth
-    bid_levels: list = field(default_factory=list)  # list[PriceLevel], full bid depth
-
-    @property
-    def spread(self) -> Optional[float]:
-        """Get bid-ask spread."""
-        if self.best_bid is not None and self.best_ask is not None:
-            return self.best_ask - self.best_bid
-        return None
-
-    @property
-    def mid_price(self) -> Optional[float]:
-        """Get mid price."""
-        if self.best_bid is not None and self.best_ask is not None:
-            return (self.best_bid + self.best_ask) / 2
-        return None
-
-    def is_stale(self, ttl_ms: float) -> bool:
-        """Check if this BBA data is stale."""
-        age_ms = (datetime.utcnow() - self.last_updated).total_seconds() * 1000
-        return age_ms > ttl_ms
-
-
-@dataclass
-class Outcome:
-    """
-    A single outcome in a neg-risk event.
-
-    For example, in "Who wins the 2024 election?":
-    - Outcome 1: "Trump" with token_id "123..."
-    - Outcome 2: "Biden" with token_id "456..."
-    - Outcome 3: "Other" with token_id "789..."
-    """
-    outcome_id: str               # Unique identifier
-    market_id: str                # Polymarket market ID for this outcome
-    condition_id: str             # Condition ID
-    token_id: str                 # CLOB token ID for YES shares
-    name: str                     # Display name (e.g., "Trump")
-    status: OutcomeStatus = OutcomeStatus.ACTIVE
-
-    # Current BBA data
-    bba: OutcomeBBA = field(default_factory=OutcomeBBA)
-
-    # Metadata
-    volume_24h: float = 0.0
-    liquidity: float = 0.0
-
-    @property
-    def ask_price(self) -> Optional[float]:
-        """Get current ask price (cost to buy YES)."""
-        return self.bba.best_ask
-
-    @property
-    def bid_price(self) -> Optional[float]:
-        """Get current bid price."""
-        return self.bba.best_bid
-
-    def is_tradeable(self, config: NegriskConfig) -> bool:
-        """
-        Check if this outcome is tradeable (buy-side).
-
-        CRITICAL: For neg-risk arb, we MUST include "Other" outcomes.
-        Skipping "Other" means we don't hold all outcomes and can lose principal.
-        """
-        # CRITICAL FIX: Include OTHER status in tradeable outcomes
-        # Only skip PLACEHOLDER (unnamed in augmented neg-risk) and RESOLVED
-        if self.status == OutcomeStatus.RESOLVED:
-            return False
-
-        # Skip placeholders only if configured (augmented neg-risk)
-        if config.skip_augmented_placeholders and self.status == OutcomeStatus.PLACEHOLDER:
-            return False
-
-        # Must have an ask price
-        if self.bba.best_ask is None:
-            return False
-
-        # Must meet minimum liquidity
-        if self.bba.ask_size is not None and self.bba.ask_size < config.min_liquidity_per_outcome:
-            return False
-
-        return True
-
-    def is_tradeable_sell_side(self, config: NegriskConfig) -> bool:
-        """
-        Check if this outcome is tradeable for sell-side arb.
-
-        Same status rules as buy-side, but requires bid price and bid liquidity.
-        """
-        if self.status == OutcomeStatus.RESOLVED:
-            return False
-
-        if config.skip_augmented_placeholders and self.status == OutcomeStatus.PLACEHOLDER:
-            return False
-
-        # Must have a bid price (someone willing to buy our YES shares)
-        if self.bba.best_bid is None:
-            return False
-
-        # Must meet minimum bid-side liquidity
-        if self.bba.bid_size is not None and self.bba.bid_size < config.min_liquidity_per_outcome:
-            return False
-
-        return True
-
-
-@dataclass
-class NegriskEvent:
-    """
-    A neg-risk event containing multiple mutually exclusive outcomes.
-
-    For example: "2024 Presidential Election Winner"
-    - Contains outcomes for each candidate
-    - Only ONE outcome can win (winner-take-all)
-    - NegRisk adapter enables capital-efficient trading
-    """
-    event_id: str                 # Gamma API event ID
-    slug: str                     # URL slug
-    title: str                    # Event title/question
-    condition_id: str             # CTF condition ID
-    platform: str = "polymarket"  # Platform identifier
-    category: str = ""            # Event category (e.g. "crypto", "sports", "politics")
-
-    # Outcomes
-    outcomes: list[Outcome] = field(default_factory=list)
-
-    # Neg-risk flags
-    neg_risk: bool = True
-    neg_risk_augmented: bool = False  # Has placeholder outcomes
-
-    # Metadata
-    volume_24h: float = 0.0
-    liquidity: float = 0.0
-    end_date: Optional[datetime] = None
-    created_at: Optional[datetime] = None
-
-    # Per-event fee rate (used by Limitless dynamic fees; 0 = use model default)
-    fee_rate_bps: float = 0.0
-
-    # Priority scoring
-    priority_score: float = 0.0              # Higher = more priority (0.0-1.5 range)
-    hours_to_resolution: Optional[float] = None
-    spread_volatility: float = 0.0           # Avg spread across outcomes (0 = tight, 1 = wide)
-
-    # Tracking
-    last_updated: datetime = field(default_factory=datetime.utcnow)
-
-    @property
-    def outcome_count(self) -> int:
-        """Get number of outcomes."""
-        return len(self.outcomes)
-
-    @property
-    def active_outcomes(self) -> list[Outcome]:
-        """
-        Get tradeable outcomes (includes OTHER, excludes PLACEHOLDER/RESOLVED).
-
-        CRITICAL: This must include "Other" outcomes for neg-risk arb to work.
-        """
-        return [
-            o for o in self.outcomes
-            if o.status not in (OutcomeStatus.RESOLVED, OutcomeStatus.PLACEHOLDER)
-        ]
-
-    @property
-    def sum_of_asks(self) -> Optional[float]:
-        """
-        Calculate sum of all ask prices.
-
-        If < 1.0, there's a potential arbitrage opportunity.
-        Returns None if any ask price is unavailable.
-        """
-        asks = [o.bba.best_ask for o in self.active_outcomes]
-        if None in asks or len(asks) == 0:
-            return None
-        return sum(asks)
-
-    @property
-    def sum_of_bids(self) -> Optional[float]:
-        """Calculate sum of all bid prices."""
-        bids = [o.bba.best_bid for o in self.active_outcomes]
-        if None in bids or len(bids) == 0:
-            return None
-        return sum(bids)
-
-    @property
-    def min_ask_liquidity(self) -> Optional[float]:
-        """Get minimum liquidity across all asks (bottleneck for sizing)."""
-        sizes = [o.bba.ask_size for o in self.active_outcomes if o.bba.ask_size is not None]
-        if not sizes:
-            return None
-        return min(sizes)
-
-    @property
-    def min_bid_liquidity(self) -> Optional[float]:
-        """Get minimum liquidity across all bids (bottleneck for sell-side sizing)."""
-        sizes = [o.bba.bid_size for o in self.active_outcomes if o.bba.bid_size is not None]
-        if not sizes:
-            return None
-        return min(sizes)
-
-    def get_token_ids(self) -> list[str]:
-        """Get all token IDs for WebSocket subscription."""
-        return [o.token_id for o in self.outcomes if o.token_id]
-
-    def get_effective_staleness_ttl(self, config: 'NegriskConfig') -> float:
-        """
-        Get effective staleness TTL based on event category.
-
-        Crypto/fast-moving events use strict TTL (3s).
-        Low-volatility events (weather, entertainment) use relaxed TTL (15s).
-        Everything else uses the default (5s).
-        """
-        cat = self.category.lower()
-        if cat in ("crypto", "finance"):
-            return config.staleness_ttl_strict_ms
-        elif cat in ("weather", "entertainment", "culture", "science"):
-            return config.staleness_ttl_relaxed_ms
-        return config.staleness_ttl_ms
-
-    def has_stale_data(self, ttl_ms: float) -> bool:
-        """Check if any outcome has stale BBA data."""
-        return any(o.bba.is_stale(ttl_ms) for o in self.active_outcomes)
-
-    def has_stale_data_adaptive(self, config: 'NegriskConfig') -> bool:
-        """Check staleness using category-adaptive TTL."""
-        ttl = self.get_effective_staleness_ttl(config)
-        return any(o.bba.is_stale(ttl) for o in self.active_outcomes)
+NegriskEvent = MarketEvent
 
 
 @dataclass

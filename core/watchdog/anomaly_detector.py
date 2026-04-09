@@ -54,13 +54,10 @@ class AnomalyDetector:
         if current_price is not None and current_price < self.config.min_price_floor:
             return None
 
-        # NOTE: We intentionally do NOT hard-filter near-resolution prices
-        # (>=95c or <=5c) here. A market can spike from 7c to 96c due to
-        # insider trading — filtering on price_after would suppress the exact
-        # signal we want. Instead, _compute_suspicion_score applies a -2 point
-        # penalty when price lands near resolution, and the news_driven check
-        # handles the real disambiguation (news = legitimate resolution,
-        # no news = suspicious).
+        # Skip near-resolution prices. These late-stage jumps are often normal
+        # resolution behavior and generate noisy replay alerts.
+        if current_price is not None and current_price >= self.config.resolution_price_ceiling:
+            return None
 
         # Check cooldown
         now = datetime.utcnow()

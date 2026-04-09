@@ -461,5 +461,8 @@ Examples:
 
 
 if __name__ == "__main__":
+    print(
+        "DEPRECATED: use `python -m apps.negrisk scan` instead.",
+        file=sys.stderr,
+    )
     main()
-

@@ -1,0 +1,1 @@
+"""Watchdog app tests."""

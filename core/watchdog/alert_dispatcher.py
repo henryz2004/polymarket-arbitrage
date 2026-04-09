@@ -8,16 +8,19 @@ Built-in channels:
 - ConsoleChannel: colored terminal output
 - FileChannel: JSONL append to logs/watchdog/
 
-Extensible via AlertChannel ABC for future webhook/Telegram support.
+Extensible via AlertChannel ABC for webhook/Telegram support.
 """
 
 import json
 import logging
+import os
 import sys
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+import httpx
 
 from core.watchdog.models import AnomalyAlert
 
@@ -165,6 +168,89 @@ class FileChannel(AlertChannel):
                 f.write(json.dumps(alert.to_dict()) + "\n")
         except Exception as e:
             logger.error(f"Failed to write alert to file: {e}")
+
+
+class DiscordWebhookChannel(AlertChannel):
+    """Sends formatted watchdog alerts to a Discord webhook."""
+
+    def __init__(self, webhook_url: str):
+        self.webhook_url = webhook_url
+        self._client: Optional[httpx.AsyncClient] = None
+
+    @classmethod
+    def from_env(cls) -> Optional["DiscordWebhookChannel"]:
+        webhook_url = os.environ.get("ALERT_WEBHOOK_URL", "").strip()
+        if not webhook_url:
+            return None
+        if "discord.com/api/webhooks/" not in webhook_url:
+            logger.warning("ALERT_WEBHOOK_URL is set but does not look like a Discord webhook")
+            return None
+        return cls(webhook_url)
+
+    async def start(self) -> None:
+        if not self._client:
+            self._client = httpx.AsyncClient(timeout=10.0)
+
+    async def stop(self) -> None:
+        if self._client:
+            await self._client.aclose()
+            self._client = None
+
+    async def send(self, alert: AnomalyAlert) -> None:
+        if not self._client:
+            await self.start()
+
+        direction = getattr(alert, "direction", "up")
+        direction_label = "SELL-SIDE" if direction == "down" else "BUY-SIDE"
+        catalyst_label = "NEWS-DRIVEN" if alert.news_driven else "UNEXPLAINED"
+        color = 0xE74C3C if alert.suspicion_score >= 7 else 0xF1C40F if alert.suspicion_score >= 5 else 0x3498DB
+
+        description = (
+            f"**Outcome:** {alert.outcome_name}\n"
+            f"**Move:** ${alert.price_before:.3f} -> ${alert.price_after:.3f}\n"
+            f"**Change:** {alert.pct_change * 100:.1f}% / ${alert.abs_change:.3f}\n"
+            f"**Window:** {self._format_window(alert.window_seconds)}\n"
+            f"**Direction:** {direction_label}\n"
+            f"**Catalyst:** {catalyst_label}\n"
+            f"**Off Hours:** {'Yes' if alert.is_off_hours else 'No'}\n"
+            f"**24h Volume:** ${alert.event_volume_24h:,.0f}"
+        )
+        if getattr(alert, "correlated_outcomes", 0) > 0:
+            description += f"\n**Correlated Outcomes:** {alert.correlated_outcomes}"
+        if alert.news_headlines:
+            top = []
+            for headline in alert.news_headlines[:3]:
+                top.append(f"- {headline.title if hasattr(headline, 'title') else headline}")
+            description += "\n**Headlines:**\n" + "\n".join(top)
+
+        payload = {
+            "embeds": [
+                {
+                    "title": f"Watchdog Alert [{alert.suspicion_score:.1f}/10]",
+                    "description": description,
+                    "color": color,
+                    "timestamp": alert.detected_at.replace(tzinfo=timezone.utc).isoformat(),
+                    "fields": [
+                        {"name": "Event", "value": alert.event_title[:1024] or "n/a", "inline": False},
+                        {"name": "Slug", "value": alert.event_slug[:1024] or "n/a", "inline": False},
+                    ],
+                }
+            ]
+        }
+
+        try:
+            resp = await self._client.post(self.webhook_url, json=payload)
+            if resp.status_code >= 400:
+                logger.warning(f"Discord webhook returned {resp.status_code}: {resp.text[:200]}")
+        except Exception as e:
+            logger.warning(f"Discord webhook alert failed: {e}")
+
+    def _format_window(self, seconds: int) -> str:
+        if seconds < 3600:
+            return f"{seconds // 60} min"
+        if seconds < 86400:
+            return f"{seconds / 3600:.1f}h"
+        return f"{seconds / 86400:.1f}d"
 
 
 class AlertDispatcher:

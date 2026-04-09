@@ -318,4 +318,8 @@ Examples:
 
 
 if __name__ == "__main__":
+    print(
+        "DEPRECATED: use `python -m apps.watchdog scan --platform polymarket` instead.",
+        file=sys.stderr,
+    )
     asyncio.run(main())

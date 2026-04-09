@@ -531,5 +531,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    print(
+        "DEPRECATED: use `python -m apps.negrisk dashboard` instead.",
+        file=sys.stderr,
+    )
     main()
-

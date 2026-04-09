@@ -15,8 +15,14 @@ from core.watchdog.models import WatchdogConfig, PriceSnapshot, AnomalyAlert
 from core.watchdog.price_tracker import PriceTracker
 from core.watchdog.anomaly_detector import AnomalyDetector
 from core.watchdog.news_checker import NewsChecker
-from core.watchdog.alert_dispatcher import AlertDispatcher, ConsoleChannel, FileChannel
+from core.watchdog.alert_dispatcher import (
+    AlertDispatcher,
+    ConsoleChannel,
+    DiscordWebhookChannel,
+    FileChannel,
+)
 from core.watchdog.engine import WatchdogEngine
+from core.watchdog.platforms.kalshi import KalshiWatchdogConfig, KalshiWatchdogEngine
 
 __all__ = [
     "WatchdogConfig",
@@ -27,6 +33,9 @@ __all__ = [
     "NewsChecker",
     "AlertDispatcher",
     "ConsoleChannel",
+    "DiscordWebhookChannel",
     "FileChannel",
     "WatchdogEngine",
+    "KalshiWatchdogConfig",
+    "KalshiWatchdogEngine",
 ]
