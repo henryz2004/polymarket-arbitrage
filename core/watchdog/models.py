@@ -65,6 +65,16 @@ class WatchdogConfig:
     resolution_price_ceiling: float = 0.95  # Ignore outcomes at/above 95c (resolution, not insider)
     warmup_seconds: float = 300.0  # Don't fire alerts until 5min of live data
 
+    # Live sports/esports slug prefixes to skip — these resolve in real-time
+    # during gameplay and produce constant large swings that aren't insider
+    # trading. Season-long futures (e.g. "2026-nba-champion") are NOT filtered.
+    skip_live_event_slug_prefixes: list[str] = field(default_factory=lambda: [
+        "cs2-", "lol-", "val-", "dota2-",          # Esports
+        "nba-", "nhl-", "mlb-", "nfl-",            # US sports (live matches)
+        "wta-", "atp-",                             # Tennis
+        "blast-open-",                              # CS2 tournament events
+    ])
+
     # Alert dedup
     alert_cooldown_seconds: float = 300.0
 
@@ -119,6 +129,7 @@ class AnomalyAlert:
 
     # Fields with defaults
     direction: str = "up"    # "up" (buy-side) or "down" (sell-side)
+    correlated_outcomes: int = 0  # >0 if detected via cross-market correlation
     news_headlines: list[str] = field(default_factory=list)
     news_driven: bool = False
     detected_at: datetime = field(default_factory=datetime.utcnow)
@@ -139,6 +150,7 @@ class AnomalyAlert:
             "window_seconds": self.window_seconds,
             "threshold_type": self.threshold_type,
             "direction": self.direction,
+            "correlated_outcomes": self.correlated_outcomes,
             "suspicion_score": round(self.suspicion_score, 2),
             "is_off_hours": self.is_off_hours,
             "event_volume_24h": self.event_volume_24h,

@@ -80,20 +80,29 @@ class ConsoleChannel(AlertChannel):
         off_hours_tag = " (OFF HOURS)" if alert.is_off_hours else ""
         direction_label = "SELL-SIDE" if direction == "down" else "BUY-SIDE"
 
+        correlated = getattr(alert, 'correlated_outcomes', 0)
         if alert.news_driven:
             catalyst_label = self._color("NEWS-DRIVEN", f"{self.BOLD}{self.GREEN}")
         else:
             catalyst_label = self._color("UNEXPLAINED", f"{self.BOLD}{self.RED}")
+
+        corr_tag = ""
+        if correlated > 0:
+            corr_tag = self._color(
+                f" [CORRELATED: {correlated} outcomes]",
+                f"{self.BOLD}{self.YELLOW}"
+            )
 
         print()
         print(self._color(f"{'=' * 60}", header_color))
         print(self._color(
             f"SUSPICIOUS ACTIVITY [{direction_label}] [Score: {score:.1f}/10]",
             f"{self.BOLD}{header_color}"
-        ) + f"  {catalyst_label}")
+        ) + f"  {catalyst_label}{corr_tag}")
         print(self._color(f"{'=' * 60}", header_color))
         print(f"  Market:  {alert.event_title}")
-        print(f"  Outcome: {alert.outcome_name}")
+        print(f"  Outcome: {alert.outcome_name} (best of {correlated})" if correlated > 0
+              else f"  Outcome: {alert.outcome_name}")
         print(f"  Price:   ${alert.price_before:.3f} -> ${alert.price_after:.3f} "
               f"({pct_str} / {abs_str}) in {window_str}")
         print(f"  Time:    {time_str}{off_hours_tag}")

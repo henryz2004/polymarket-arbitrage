@@ -164,6 +164,11 @@ class PriceTracker:
         instead of rebuilding a filtered list on every call. This avoids
         O(N) list comprehensions per threshold per market per scan cycle.
 
+        Gap-aware: when there's a data gap (e.g. 12 hours of no quotes),
+        finds the last known price BEFORE the window as baseline, rather
+        than comparing the current price against itself (which would yield
+        0% change and miss the spike entirely).
+
         Returns:
             (price_before, price_now, pct_change) or None if insufficient data.
             pct_change is a fraction (e.g. 1.79 for 179%).
@@ -181,18 +186,23 @@ class PriceTracker:
 
         cutoff = now - timedelta(seconds=window_seconds)
 
-        # Find the snapshot closest to the cutoff time
+        # Find the best baseline: the most recent snapshot AT or BEFORE the
+        # cutoff. This correctly handles data gaps — if a token has no trades
+        # for hours and then a sudden buy moves the price 11c, we compare
+        # against the last known price before the gap, not the current price.
         price_before = None
-        for snapshot in live:
-            if snapshot.mid_price is not None and snapshot.timestamp >= cutoff:
-                price_before = snapshot.mid_price
+        for i in range(len(live) - 2, -1, -1):
+            snap = live[i]
+            if snap.mid_price is not None and snap.timestamp <= cutoff:
+                price_before = snap.mid_price
                 break
 
-        # If no snapshot after cutoff, use the oldest live snapshot
+        # Fallback: if no snapshot at/before cutoff (all data is within the
+        # window), use the oldest available snapshot (excluding the latest).
         if price_before is None:
-            for snapshot in live:
-                if snapshot.mid_price is not None:
-                    price_before = snapshot.mid_price
+            for i in range(len(live) - 1):
+                if live[i].mid_price is not None:
+                    price_before = live[i].mid_price
                     break
 
         if price_before is None or price_before == 0:
