@@ -14,6 +14,7 @@ Features:
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime
 from typing import AsyncIterator, Callable, Optional
 
@@ -81,6 +82,11 @@ class BBATracker:
         self._empty_books: int = 0
         self._last_ws_message: Optional[datetime] = None
 
+        # Per-session diagnostics
+        self._ws_session_start: float = 0.0
+        self._ws_session_msgs: int = 0
+        self._ws_subscribe_size: int = 0
+
     async def start(self) -> None:
         """Start the BBA tracker."""
         if self._running:
@@ -134,7 +140,16 @@ class BBATracker:
                 await self._run_websocket()
             except ConnectionClosed as e:
                 self.ws_connected = False
-                logger.warning(f"WebSocket closed: {e}. Reconnecting in {reconnect_delay}s...")
+                lifetime = time.monotonic() - self._ws_session_start if self._ws_session_start else 0
+                close_code = e.rcvd.code if e.rcvd else None
+                close_reason = e.rcvd.reason if e.rcvd else None
+                logger.warning(
+                    f"WebSocket closed: code={close_code} reason={close_reason!r} "
+                    f"session_lifetime={lifetime:.1f}s "
+                    f"session_msgs={self._ws_session_msgs} "
+                    f"subscribe_payload_bytes={self._ws_subscribe_size} "
+                    f"Reconnecting in {reconnect_delay}s..."
+                )
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
             except asyncio.CancelledError:
@@ -142,12 +157,23 @@ class BBATracker:
                 raise
             except Exception as e:
                 self.ws_connected = False
-                logger.error(f"WebSocket error: {e}. Reconnecting in {reconnect_delay}s...")
+                lifetime = time.monotonic() - self._ws_session_start if self._ws_session_start else 0
+                logger.error(
+                    f"WebSocket error: {type(e).__name__}: {e} "
+                    f"session_lifetime={lifetime:.1f}s "
+                    f"session_msgs={self._ws_session_msgs} "
+                    f"Reconnecting in {reconnect_delay}s..."
+                )
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
 
     async def _run_websocket(self) -> None:
         """Run a single WebSocket connection session."""
+        # Reset per-session diagnostics before attempting connection
+        self._ws_session_start = 0.0
+        self._ws_session_msgs = 0
+        self._ws_subscribe_size = 0
+
         # Get token IDs — use filter if provided (watchdog), else all registry tokens
         if self._token_filter:
             token_ids = self._token_filter()
@@ -170,6 +196,8 @@ class BBATracker:
             # Reset reconnect delay on successful connection
             was_disconnected = not self.ws_connected
             self.ws_connected = True
+            self._ws_session_start = time.monotonic()
+            self._ws_session_msgs = 0
             logger.info("WebSocket connected")
 
             # Subscribe to all tokens
@@ -177,8 +205,13 @@ class BBATracker:
                 "type": "MARKET",
                 "assets_ids": token_ids,
             }
-            await ws.send(json.dumps(subscribe_msg))
-            logger.info(f"Subscribed to {len(token_ids)} tokens")
+            payload = json.dumps(subscribe_msg)
+            self._ws_subscribe_size = len(payload)
+            await ws.send(payload)
+            logger.info(
+                f"Subscribed to {len(token_ids)} tokens "
+                f"(payload {self._ws_subscribe_size:,} bytes)"
+            )
 
             # Post-reconnect: re-seed CLOB data for near-opportunity events
             # After a disconnect, BBA data becomes stale. Re-seeding ensures
@@ -194,6 +227,7 @@ class BBATracker:
                 if not self._running:
                     break
 
+                self._ws_session_msgs += 1
                 await self._process_ws_message(message)
 
     async def _process_ws_message(self, message: str) -> None:

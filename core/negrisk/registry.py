@@ -70,7 +70,7 @@ class NegriskRegistry:
 
         self._running = True
         self._http_client = httpx.AsyncClient(
-            timeout=30.0,
+            timeout=45.0,
             limits=httpx.Limits(
                 max_connections=20,
                 max_keepalive_connections=5,
@@ -117,6 +117,36 @@ class NegriskRegistry:
                 logger.error(f"Registry refresh error: {e}")
                 await asyncio.sleep(5)
 
+    async def _fetch_with_retry(
+        self, url: str, params: dict, max_retries: int = 3
+    ) -> Optional[httpx.Response]:
+        """Fetch URL with exponential backoff on timeout/5xx errors."""
+        for attempt in range(max_retries + 1):
+            try:
+                resp = await self._http_client.get(url, params=params)
+                if resp.status_code == 200:
+                    return resp
+                if resp.status_code >= 500 and attempt < max_retries:
+                    delay = min(2 ** attempt, 10)
+                    logger.warning(
+                        f"Gamma API returned {resp.status_code}, "
+                        f"retry {attempt + 1}/{max_retries} in {delay}s"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                return resp  # 4xx or final 5xx
+            except httpx.TransportError as e:
+                if attempt < max_retries:
+                    delay = min(2 ** attempt, 10)
+                    logger.warning(
+                        f"Gamma API {type(e).__name__}, "
+                        f"retry {attempt + 1}/{max_retries} in {delay}s"
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    raise
+        return None
+
     async def _fetch_negrisk_events(self) -> None:
         """Fetch all neg-risk events from Gamma API."""
         try:
@@ -127,7 +157,7 @@ class NegriskRegistry:
             logger.debug("Fetching neg-risk events from Gamma API...")
 
             while self._running:
-                resp = await self._http_client.get(
+                resp = await self._fetch_with_retry(
                     f"{self.GAMMA_API_URL}/events",
                     params={
                         "limit": limit,
@@ -137,8 +167,9 @@ class NegriskRegistry:
                     },
                 )
 
-                if resp.status_code != 200:
-                    logger.error(f"Gamma API error: {resp.status_code}")
+                if resp is None or resp.status_code != 200:
+                    status = resp.status_code if resp else "no response"
+                    logger.error(f"Gamma API error: {status}")
                     break
 
                 events = resp.json()
