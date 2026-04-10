@@ -1,6 +1,6 @@
 services:
   polymarket-watchdog:
-    build: .
+    image: ghcr.io/henryz2004/polymarket-arbitrage:latest
     container_name: polymarket-watchdog
     restart: unless-stopped
     environment:
@@ -11,11 +11,8 @@ services:
       - scan
       - --platform
       - polymarket
-      - --config
-      - config/watchdog.polymarket.yaml
     volumes:
       - polymarket_watchdog_logs:/app/logs
-      - ./config:/app/config:ro
     logging:
       driver: json-file
       options:
