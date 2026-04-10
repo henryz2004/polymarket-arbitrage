@@ -216,7 +216,9 @@ class NegriskRegistry:
             )
 
         except Exception as e:
-            logger.error(f"Failed to fetch neg-risk events: {e}")
+            logger.error(
+                f"Failed to fetch neg-risk events: {type(e).__name__}: {e!r}"
+            )
 
     def _calculate_priority_scores(self) -> None:
         """

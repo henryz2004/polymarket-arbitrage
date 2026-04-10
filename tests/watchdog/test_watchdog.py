@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from core.watchdog.anomaly_detector import AnomalyDetector
+from core.watchdog.engine import WatchdogEngine
 from core.watchdog.models import AnomalyAlert, NewsHeadline, PriceSnapshot, WatchdogConfig
 from core.watchdog.news_checker import NewsChecker
 from core.watchdog.price_tracker import PriceTracker, WatchedMarket
@@ -1611,3 +1612,97 @@ class TestLiveEventFiltering:
         assert detector._is_live_event("2026-fifa-world-cup-winner-595") is False
         assert detector._is_live_event("iran-leadership-change-by") is False
         assert detector._is_live_event("") is False
+
+
+class TestWatchlistFiltering:
+    """Watchlist-specific filtering behavior for the watchdog engine."""
+
+    def test_keyword_matching_uses_word_boundaries(self):
+        config = make_config()
+        config.watch_keywords = ["war", "ban", "sec"]
+        engine = WatchdogEngine(config)
+
+        warsaw = make_event(
+            event_id="warsaw-weather",
+            title="Highest temperature in Warsaw on April 9?",
+            slug="highest-temperature-in-warsaw-on-april-9-2026",
+        )
+        bank = make_event(
+            event_id="spacex-bank",
+            title="Lead Bank in SpaceX's IPO?",
+            slug="lead-bank-in-spacexs-ipo-836",
+        )
+        second = make_event(
+            event_id="eurovision",
+            title="Eurovision 2026: Second Semi-Final",
+            slug="eurovision-2026-second-semi-final",
+        )
+
+        assert engine._should_watch(warsaw) is False
+        assert engine._should_watch(bank) is False
+        assert engine._should_watch(second) is False
+
+    def test_live_event_slug_filtered_before_subscription(self):
+        config = make_config()
+        config.watch_keywords = ["strike"]
+        engine = WatchdogEngine(config)
+
+        esports = make_event(
+            event_id="cs2",
+            title="Counter-Strike: Monte vs Passion UA (BO3)",
+            slug="cs2-monte-passion-2026-03-31",
+        )
+
+        assert engine._should_watch(esports) is False
+
+    def test_large_menu_market_skipped(self):
+        config = make_config(max_watch_outcomes=32)
+        config.watch_keywords = ["nominee"]
+        engine = WatchdogEngine(config)
+
+        outcomes = [
+            Outcome(
+                outcome_id=f"o{i}",
+                market_id=f"m{i}",
+                condition_id=f"c{i}",
+                token_id=f"token_{i}",
+                name=f"Candidate {i}",
+                status=OutcomeStatus.ACTIVE,
+                bba=OutcomeBBA(best_bid=0.10, best_ask=0.12),
+            )
+            for i in range(40)
+        ]
+        event = make_event(
+            event_id="nominee2028",
+            title="Democratic Presidential Nominee 2028",
+            slug="democratic-presidential-nominee-2028",
+            outcomes=outcomes,
+        )
+
+        assert engine._should_watch(event) is False
+
+    def test_force_watch_slug_overrides_size_and_live_filters(self):
+        config = make_config(max_watch_outcomes=2)
+        config.watch_slugs = ["cs2-monte-passion-2026-03-31"]
+        engine = WatchdogEngine(config)
+
+        outcomes = [
+            Outcome(
+                outcome_id=f"o{i}",
+                market_id=f"m{i}",
+                condition_id=f"c{i}",
+                token_id=f"token_force_{i}",
+                name=f"Outcome {i}",
+                status=OutcomeStatus.ACTIVE,
+                bba=OutcomeBBA(best_bid=0.10, best_ask=0.12),
+            )
+            for i in range(4)
+        ]
+        event = make_event(
+            event_id="forced-live",
+            title="Counter-Strike: Monte vs Passion UA (BO3)",
+            slug="cs2-monte-passion-2026-03-31",
+            outcomes=outcomes,
+        )
+
+        assert engine._should_watch(event) is True

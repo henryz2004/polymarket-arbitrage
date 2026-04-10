@@ -15,6 +15,7 @@ Coordinates:
 
 import asyncio
 import logging
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -214,17 +215,43 @@ class WatchdogEngine:
             if event.slug in self.config.watch_slugs:
                 return True
 
+        # Skip live sports/esports events before they enter the watchlist.
+        if self._is_live_event(event.slug):
+            return False
+
+        # Skip giant menu markets that consume a disproportionate amount of the
+        # WebSocket subscription budget and are rarely actionable for this use case.
+        if len(event.active_outcomes) > self.config.max_watch_outcomes:
+            return False
+
         # Check volume threshold
         if event.volume_24h < self.config.min_event_volume_24h:
             return False
 
         # Check keyword match in title
-        title_lower = event.title.lower()
+        normalized_title = self._normalize_match_text(event.title)
         for keyword in self.config.watch_keywords:
-            if keyword.lower() in title_lower:
+            if self._keyword_matches_title(keyword, normalized_title):
                 return True
 
         return False
+
+    @staticmethod
+    def _normalize_match_text(text: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+    @classmethod
+    def _keyword_matches_title(cls, keyword: str, normalized_title: str) -> bool:
+        normalized_keyword = cls._normalize_match_text(keyword)
+        if not normalized_keyword or not normalized_title:
+            return False
+        return f" {normalized_keyword} " in f" {normalized_title} "
+
+    def _is_live_event(self, slug: str) -> bool:
+        """Check if an event slug matches live sports/esports patterns."""
+        if not slug:
+            return False
+        return any(slug.startswith(prefix) for prefix in self.config.skip_live_event_slug_prefixes)
 
     def _on_price_update(self, event_id: str, token_id: str) -> None:
         """

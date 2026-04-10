@@ -64,6 +64,7 @@ class WatchdogConfig:
     min_price_floor: float = 0.03  # Ignore outcomes priced below 3c (too noisy)
     resolution_price_ceiling: float = 0.95  # Ignore outcomes at/above 95c (resolution, not insider)
     warmup_seconds: float = 300.0  # Don't fire alerts until 5min of live data
+    max_watch_outcomes: int = 32  # Skip giant menu markets that swamp WS capacity
 
     # Live sports/esports slug prefixes to skip — these resolve in real-time
     # during gameplay and produce constant large swings that aren't insider
