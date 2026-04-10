@@ -290,9 +290,16 @@ class WatchdogEngine:
             try:
                 self._total_scans += 1
 
-                # Re-discover events periodically (registry may have refreshed)
-                if self._total_scans % 10 == 0:
-                    self._discover_and_watch()
+                # Re-discover events periodically (registry may have refreshed).
+                # If startup came up empty, retry every scan so the watchdog can
+                # recover quickly once the registry begins returning events.
+                watched_now = len(self.price_tracker.get_watched_markets())
+                if watched_now == 0 or self._total_scans % 10 == 0:
+                    discovered = self._discover_and_watch()
+                    if discovered and discovered != watched_now:
+                        logger.info(
+                            f"Watchlist refreshed: now watching {discovered} outcome tokens"
+                        )
 
                 # Skip anomaly checks during warmup — just collect data
                 if not self._past_warmup():
