@@ -189,8 +189,8 @@ class BBATracker:
 
         async with websockets.connect(
             self.WS_URL,
-            ping_interval=None,
-            ping_timeout=None,
+            ping_interval=20,
+            ping_timeout=10,
             close_timeout=5,
         ) as ws:
             # Reset reconnect delay on successful connection
