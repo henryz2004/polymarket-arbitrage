@@ -63,9 +63,10 @@ class WatchdogRunner:
 
     def __init__(self, config: WatchdogConfig, duration_hours: float = 24.0):
         self.config = config
-        self.duration = timedelta(hours=duration_hours)
+        self.duration_hours = duration_hours
+        self.duration = timedelta(hours=duration_hours) if duration_hours > 0 else None
         self.start_time = datetime.now()
-        self.end_time = self.start_time + self.duration
+        self.end_time = (self.start_time + self.duration) if self.duration else None
 
         # Logging setup
         self.log_dir = Path("logs/watchdog")
@@ -122,7 +123,8 @@ class WatchdogRunner:
         self.logger.info("=" * 80)
         self.logger.info("SUSPICIOUS ACTIVITY WATCHDOG")
         self.logger.info("=" * 80)
-        self.logger.info(f"Duration: {self.duration.total_seconds() / 3600:.1f} hours")
+        duration_label = f"{self.duration_hours:.1f} hours" if self.duration else "unlimited"
+        self.logger.info(f"Duration: {duration_label}")
         self.logger.info(f"Keywords: {', '.join(self.config.watch_keywords[:10])}"
                         f"{'...' if len(self.config.watch_keywords) > 10 else ''}")
         if self.config.watch_slugs:
@@ -135,7 +137,7 @@ class WatchdogRunner:
         self.logger.info(f"Alert Cooldown: {self.config.alert_cooldown_seconds}s")
         self.logger.info(f"News Check: {'enabled' if self.config.news_check_enabled else 'disabled'}")
         self.logger.info(f"Start Time: {self.start_time}")
-        self.logger.info(f"End Time: {self.end_time}")
+        self.logger.info(f"End Time: {self.end_time or 'none (unlimited)'}")
         self.logger.info(f"Log File: {self.log_file}")
         self.logger.info("=" * 80)
 
@@ -179,6 +181,8 @@ class WatchdogRunner:
 
     async def _duration_loop(self):
         """Check if duration has been exceeded."""
+        if self.end_time is None:
+            return  # Run indefinitely
         while self._running:
             try:
                 if datetime.now() >= self.end_time:
