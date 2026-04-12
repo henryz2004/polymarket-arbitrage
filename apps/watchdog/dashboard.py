@@ -524,11 +524,24 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     display: inline-flex; align-items: center; gap: 4px;
     padding: 3px 10px; border-radius: 4px; font-size: 12px;
     white-space: nowrap; flex-shrink: 0;
-    animation: tickerFadeIn 0.4s ease;
   }
   .ticker-pill.up { background: rgba(63,185,80,0.12); color: var(--green); }
   .ticker-pill.down { background: rgba(248,81,73,0.12); color: var(--red); }
-  @keyframes tickerFadeIn { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
+  .ticker-pill.pop-in {
+    animation: tickerPopIn 0.35s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  }
+  .ticker-pill.fade-out {
+    animation: tickerFadeOut 0.25s ease forwards;
+    pointer-events: none;
+  }
+  @keyframes tickerPopIn {
+    from { opacity: 0; transform: translateX(-24px) scale(0.9); }
+    to   { opacity: 1; transform: translateX(0) scale(1); }
+  }
+  @keyframes tickerFadeOut {
+    from { opacity: 1; transform: scale(1); }
+    to   { opacity: 0; transform: scale(0.85); }
+  }
 
   /* --- Content --- */
   .content { padding: 0 24px 24px; }
@@ -1165,23 +1178,30 @@ function renderAlerts() {
 // =========================================================================
 // Live Ticker
 // =========================================================================
-function addTickerItem(update) {
-  tickerItems.unshift(update);
-  if (tickerItems.length > 12) tickerItems.pop();
-  renderTicker();
-}
+const MAX_TICKER = 12;
 
-function renderTicker() {
+function addTickerItem(update) {
   const container = document.getElementById('ticker-items');
-  container.innerHTML = tickerItems.map(u => {
-    const cls = u.change_pct >= 0 ? 'up' : 'down';
-    const arrow = u.change_pct >= 0 ? '\u2191' : '\u2193';
-    const name = u.outcome_name.length > 20 ? u.outcome_name.slice(0, 18) + '..' : u.outcome_name;
-    return `<span class="ticker-pill ${cls}">
-      ${esc(name)} ${fmtPrice(u.prev_price)}\u2192${fmtPrice(u.price)}
-      ${arrow}${Math.abs(u.change_pct * 100).toFixed(1)}%
-    </span>`;
-  }).join('');
+  const cls = update.change_pct >= 0 ? 'up' : 'down';
+  const arrow = update.change_pct >= 0 ? '\u2191' : '\u2193';
+  const name = update.outcome_name.length > 20 ? update.outcome_name.slice(0, 18) + '..' : update.outcome_name;
+
+  const pill = document.createElement('span');
+  pill.className = `ticker-pill ${cls} pop-in`;
+  pill.textContent = `${name} ${fmtPrice(update.prev_price)}\u2192${fmtPrice(update.price)} ${arrow}${Math.abs(update.change_pct * 100).toFixed(1)}%`;
+  container.insertBefore(pill, container.firstChild);
+
+  // Remove pop-in class after animation completes so it doesn't replay
+  pill.addEventListener('animationend', () => pill.classList.remove('pop-in'), { once: true });
+
+  // Trim excess pills with fade-out
+  while (container.children.length > MAX_TICKER) {
+    const last = container.lastElementChild;
+    last.classList.add('fade-out');
+    last.addEventListener('animationend', () => last.remove(), { once: true });
+    // Break to remove one at a time per cycle
+    break;
+  }
 }
 
 // =========================================================================
@@ -1228,12 +1248,12 @@ function connectWS() {
         setTimeout(() => { tab.style.color = ''; }, 2000);
       }
     } else if (msg.type === 'price_updates') {
-      for (const u of msg.data) {
-        addTickerItem(u);
-        // Update in-memory market data
+      // Stagger pill insertions so they pop in one by one
+      msg.data.forEach((u, i) => {
+        setTimeout(() => addTickerItem(u), i * 80);
         const m = markets.find(x => x.token_id === u.token_id);
         if (m) m.current_price = u.price;
-      }
+      });
       flashRows(msg.data);
     }
   };
