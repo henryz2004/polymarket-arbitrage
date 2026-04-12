@@ -8,9 +8,13 @@ services:
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-}
     entrypoint: ["python", "-u", "-m", "apps.watchdog"]
     command:
-      - scan
+      - dashboard
       - --platform
       - polymarket
+      - --port
+      - "8080"
+    ports:
+      - "8080:8080"
     volumes:
       - polymarket_watchdog_logs:/app/logs
     logging:

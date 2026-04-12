@@ -272,6 +272,7 @@ class AlertDispatcher:
 
     def __init__(self, channels: Optional[list[AlertChannel]] = None):
         self.channels: list[AlertChannel] = channels or []
+        self._callbacks: list = []
 
     async def start(self) -> None:
         """Start all channels."""
@@ -287,10 +288,21 @@ class AlertDispatcher:
         """Add an output channel."""
         self.channels.append(channel)
 
+    def add_callback(self, callback) -> None:
+        """Add an async callback invoked with alert.to_dict() on each dispatch."""
+        self._callbacks.append(callback)
+
     async def dispatch(self, alert: AnomalyAlert) -> None:
-        """Send alert to all channels."""
+        """Send alert to all channels and callbacks."""
         for channel in self.channels:
             try:
                 await channel.send(alert)
             except Exception as e:
                 logger.error(f"Alert channel {type(channel).__name__} failed: {e}")
+
+        alert_dict = alert.to_dict()
+        for cb in self._callbacks:
+            try:
+                await cb(alert_dict)
+            except Exception as e:
+                logger.error(f"Alert callback failed: {e}")
