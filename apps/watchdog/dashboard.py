@@ -180,19 +180,51 @@ def _load_alert_history():
 # WebSocket for live updates
 # ---------------------------------------------------------------------------
 
+# Track last-known prices for computing deltas
+_last_prices: dict[str, float] = {}
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     _ws_clients.add(ws)
     try:
         while True:
-            # Send stats every 5 seconds
             engine = _engine()
             if engine:
+                # Stats
                 stats = engine.get_stats()
                 runtime = datetime.now() - _runner.start_time
                 stats["runtime_seconds"] = runtime.total_seconds()
                 await ws.send_text(json.dumps({"type": "stats", "data": stats}, default=str))
+
+                # Price deltas
+                updates = []
+                watched = engine.price_tracker.get_watched_markets()
+                for token_id, m in watched.items():
+                    price = m.current_price
+                    if price is None:
+                        continue
+                    prev = _last_prices.get(token_id)
+                    if prev is not None and abs(price - prev) > 0.0001:
+                        change = (price - prev) / prev if prev > 0 else 0
+                        updates.append({
+                            "token_id": token_id,
+                            "outcome_name": m.outcome_name,
+                            "event_title": m.event_title,
+                            "price": round(price, 4),
+                            "prev_price": round(prev, 4),
+                            "change_pct": round(change, 4),
+                        })
+                    _last_prices[token_id] = price
+
+                if updates:
+                    # Sort by absolute change, send top 20
+                    updates.sort(key=lambda u: abs(u["change_pct"]), reverse=True)
+                    await ws.send_text(json.dumps(
+                        {"type": "price_updates", "data": updates[:20]}, default=str
+                    ))
+
             await asyncio.sleep(5)
     except (WebSocketDisconnect, Exception):
         pass
@@ -224,12 +256,14 @@ async def start_dashboard(runner, port: int = 8080):
 # HTML / JS / CSS — single-page dashboard
 # ---------------------------------------------------------------------------
 
-DASHBOARD_HTML = """<!DOCTYPE html>
+DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Watchdog Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
 <style>
   :root {
     --bg: #0d1117; --surface: #161b22; --border: #30363d;
@@ -241,18 +275,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace;
     background: var(--bg); color: var(--text); font-size: 14px;
   }
+  /* --- Header --- */
   .header {
     background: var(--surface); border-bottom: 1px solid var(--border);
     padding: 16px 24px; display: flex; align-items: center; gap: 24px;
   }
   .header h1 { font-size: 18px; font-weight: 600; color: var(--accent); }
-  .header .ws-dot {
+  .ws-dot {
     width: 8px; height: 8px; border-radius: 50%; background: var(--red);
     display: inline-block;
   }
-  .header .ws-dot.connected { background: var(--green); }
+  .ws-dot.connected { background: var(--green); }
+
+  /* --- Metrics --- */
   .metrics {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
     gap: 12px; padding: 16px 24px;
   }
   .metric-card {
@@ -261,9 +298,31 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
   .metric-card .label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; }
   .metric-card .value { font-size: 22px; font-weight: 700; margin-top: 4px; }
+
+  /* --- Live Ticker --- */
+  .ticker-strip {
+    padding: 0 24px; margin-bottom: 8px; height: 36px;
+    display: flex; align-items: center; gap: 8px; overflow: hidden;
+  }
+  .ticker-strip .ticker-label {
+    font-size: 11px; color: var(--text-dim); text-transform: uppercase;
+    letter-spacing: 0.5px; flex-shrink: 0;
+  }
+  .ticker-items { display: flex; gap: 8px; overflow: hidden; }
+  .ticker-pill {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 3px 10px; border-radius: 4px; font-size: 12px;
+    white-space: nowrap; flex-shrink: 0;
+    animation: tickerFadeIn 0.4s ease;
+  }
+  .ticker-pill.up { background: rgba(63,185,80,0.12); color: var(--green); }
+  .ticker-pill.down { background: rgba(248,81,73,0.12); color: var(--red); }
+  @keyframes tickerFadeIn { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
+
+  /* --- Content --- */
   .content { padding: 0 24px 24px; }
   .tabs {
-    display: flex; gap: 0; margin-bottom: 16px; border-bottom: 1px solid var(--border);
+    display: flex; gap: 0; margin-bottom: 12px; border-bottom: 1px solid var(--border);
   }
   .tab {
     padding: 10px 20px; cursor: pointer; color: var(--text-dim);
@@ -271,20 +330,82 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
   .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
   .tab:hover { color: var(--text); }
+  .tab .tab-count {
+    font-size: 11px; background: var(--border); color: var(--text-dim);
+    padding: 1px 6px; border-radius: 8px; margin-left: 6px;
+  }
   .panel { display: none; }
   .panel.active { display: block; }
+
+  /* --- Filter bar --- */
+  .filter-bar {
+    display: flex; gap: 8px; align-items: center; margin-bottom: 12px;
+  }
+  .filter-btn {
+    padding: 5px 14px; border-radius: 6px; font-size: 12px; font-weight: 500;
+    cursor: pointer; border: 1px solid var(--border); background: transparent;
+    color: var(--text-dim); transition: all 0.15s;
+  }
+  .filter-btn.active { background: var(--accent); color: #0d1117; border-color: var(--accent); }
+  .filter-btn:hover:not(.active) { border-color: var(--text-dim); color: var(--text); }
+  .search-bar {
+    flex: 1; padding: 6px 12px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 6px; color: var(--text); font-size: 13px;
+  }
+  .search-bar::placeholder { color: var(--text-dim); }
+
+  /* --- Table --- */
   table { width: 100%; border-collapse: collapse; }
   th, td {
-    text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border);
+    text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border);
     font-size: 13px; white-space: nowrap;
   }
-  th { color: var(--text-dim); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; cursor: pointer; }
+  th {
+    color: var(--text-dim); font-weight: 500; font-size: 11px;
+    text-transform: uppercase; letter-spacing: 0.5px; cursor: pointer;
+    user-select: none;
+  }
   th:hover { color: var(--text); }
-  tr:hover td { background: rgba(88,166,255,0.04); }
+  th .sort-arrow { font-size: 10px; margin-left: 3px; }
+
+  /* Event group rows */
+  .event-row { cursor: pointer; }
+  .event-row td { background: var(--surface); font-weight: 600; }
+  .event-row:hover td { background: rgba(88,166,255,0.06); }
+  .event-row .chevron {
+    display: inline-block; transition: transform 0.2s; font-size: 10px;
+    margin-right: 6px; color: var(--text-dim);
+  }
+  .event-row.expanded .chevron { transform: rotate(90deg); }
+  .outcome-row { cursor: pointer; }
+  .outcome-row td:first-child { padding-left: 32px; }
+  .outcome-row:hover td { background: rgba(88,166,255,0.04); }
+
+  /* Row flash on price change */
+  .flash-green td { background: rgba(63,185,80,0.1) !important; transition: background 0.3s; }
+  .flash-red td { background: rgba(248,81,73,0.1) !important; transition: background 0.3s; }
+
+  /* Chart detail row */
+  .chart-row td {
+    padding: 16px; background: var(--surface);
+    border-bottom: 2px solid var(--border);
+  }
+  .chart-container { position: relative; height: 220px; width: 100%; }
+  .chart-header {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 8px;
+  }
+  .chart-title { font-weight: 600; font-size: 14px; }
+  .chart-meta { font-size: 12px; color: var(--text-dim); }
+  .chart-loading { text-align: center; padding: 40px; color: var(--text-dim); }
+
   .price { font-family: 'SF Mono', 'Fira Code', monospace; }
   .change-pos { color: var(--green); }
   .change-neg { color: var(--red); }
   .change-zero { color: var(--text-dim); }
+
+  /* --- Alerts --- */
   .alert-card {
     background: var(--surface); border: 1px solid var(--border);
     border-radius: 8px; padding: 16px; margin-bottom: 12px;
@@ -296,9 +417,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     margin-bottom: 8px;
   }
   .alert-card .alert-title { font-weight: 600; font-size: 14px; }
-  .alert-card .alert-score {
-    font-size: 20px; font-weight: 700; color: var(--yellow);
-  }
+  .alert-card .alert-score { font-size: 20px; font-weight: 700; color: var(--yellow); }
   .alert-card .alert-meta { font-size: 12px; color: var(--text-dim); }
   .alert-card .alert-detail { margin-top: 8px; font-size: 13px; }
   .badge {
@@ -309,18 +428,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .badge-news { background: rgba(139,148,158,0.15); color: var(--text-dim); }
   .badge-up { background: rgba(63,185,80,0.15); color: var(--green); }
   .badge-down { background: rgba(248,81,73,0.15); color: var(--red); }
-  .empty-state {
-    text-align: center; padding: 48px; color: var(--text-dim);
-  }
-  .search-bar {
-    width: 100%; padding: 8px 12px; margin-bottom: 12px;
-    background: var(--surface); border: 1px solid var(--border);
-    border-radius: 6px; color: var(--text); font-size: 13px;
-  }
-  .search-bar::placeholder { color: var(--text-dim); }
-  .truncate { max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
+
+  .empty-state { text-align: center; padding: 48px; color: var(--text-dim); }
+  .truncate { max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
   .link { color: var(--accent); text-decoration: none; }
   .link:hover { text-decoration: underline; }
+  .outcome-count {
+    font-size: 11px; color: var(--text-dim); font-weight: 400;
+    margin-left: 6px;
+  }
 </style>
 </head>
 <body>
@@ -333,32 +449,40 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <div class="metrics">
   <div class="metric-card"><div class="label">Markets Watched</div><div class="value" id="m-watched">-</div></div>
-  <div class="metric-card"><div class="label">Markets with Data</div><div class="value" id="m-data">-</div></div>
-  <div class="metric-card"><div class="label">Total Scans</div><div class="value" id="m-scans">-</div></div>
-  <div class="metric-card"><div class="label">Alerts Fired</div><div class="value" id="m-alerts">-</div></div>
-  <div class="metric-card"><div class="label">Highest Score</div><div class="value" id="m-score">-</div></div>
-  <div class="metric-card"><div class="label">WS Messages</div><div class="value" id="m-ws">-</div></div>
+  <div class="metric-card"><div class="label">With Data</div><div class="value" id="m-data">-</div></div>
+  <div class="metric-card"><div class="label">Scans</div><div class="value" id="m-scans">-</div></div>
+  <div class="metric-card"><div class="label">Alerts</div><div class="value" id="m-alerts">-</div></div>
+  <div class="metric-card"><div class="label">Top Score</div><div class="value" id="m-score">-</div></div>
+  <div class="metric-card"><div class="label">WS Msgs</div><div class="value" id="m-ws">-</div></div>
+</div>
+
+<div class="ticker-strip">
+  <span class="ticker-label">Live</span>
+  <div class="ticker-items" id="ticker-items"></div>
 </div>
 
 <div class="content">
   <div class="tabs">
-    <div class="tab active" data-panel="markets-panel">Markets</div>
-    <div class="tab" data-panel="alerts-panel">Alerts</div>
+    <div class="tab active" data-panel="markets-panel">Markets <span class="tab-count" id="markets-count">0</span></div>
+    <div class="tab" data-panel="alerts-panel">Alerts <span class="tab-count" id="alerts-count">0</span></div>
   </div>
 
   <div class="panel active" id="markets-panel">
-    <input class="search-bar" id="market-search" placeholder="Search markets..." />
+    <div class="filter-bar">
+      <button class="filter-btn active" data-filter="active">Active</button>
+      <button class="filter-btn" data-filter="all">All</button>
+      <button class="filter-btn" data-filter="alerts">With Alerts</button>
+      <input class="search-bar" id="market-search" placeholder="Search events or outcomes..." />
+    </div>
     <table>
       <thead>
         <tr>
-          <th data-sort="outcome_name">Outcome</th>
-          <th data-sort="event_title">Event</th>
+          <th data-sort="event_title">Event / Outcome</th>
           <th data-sort="current_price">Price</th>
-          <th data-sort="change_1h_pct">1h Change</th>
-          <th data-sort="change_24h_pct">24h Change</th>
-          <th data-sort="volume_24h">Volume 24h</th>
+          <th data-sort="change_1h_pct">1h</th>
+          <th data-sort="change_24h_pct">24h</th>
+          <th data-sort="volume_24h">Volume</th>
           <th data-sort="snapshots">Samples</th>
-          <th data-sort="last_update">Last Update</th>
         </tr>
       </thead>
       <tbody id="markets-body"></tbody>
@@ -374,14 +498,25 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </div>
 
 <script>
-// --- State ---
+// =========================================================================
+// State
+// =========================================================================
 let markets = [];
 let alerts = [];
 let sortCol = 'change_1h_pct';
-let sortDir = -1; // -1 = desc
+let sortDir = -1;
+let activeFilter = 'active';
+let expandedEvents = new Set();
+let openChartToken = null;
+let chartInstance = null;
+let chartCache = new Map(); // token_id -> {data, fetchedAt}
+let alertTokens = new Set();
+let tickerItems = [];
 let ws = null;
 
-// --- Tabs ---
+// =========================================================================
+// Tabs
+// =========================================================================
 document.querySelectorAll('.tab').forEach(tab => {
   tab.addEventListener('click', () => {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -391,7 +526,21 @@ document.querySelectorAll('.tab').forEach(tab => {
   });
 });
 
-// --- Sorting ---
+// =========================================================================
+// Filter buttons
+// =========================================================================
+document.querySelectorAll('.filter-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    activeFilter = btn.dataset.filter;
+    renderMarkets();
+  });
+});
+
+// =========================================================================
+// Sorting
+// =========================================================================
 document.querySelectorAll('th[data-sort]').forEach(th => {
   th.addEventListener('click', () => {
     const col = th.dataset.sort;
@@ -401,13 +550,17 @@ document.querySelectorAll('th[data-sort]').forEach(th => {
   });
 });
 
-// --- Search ---
+// =========================================================================
+// Search
+// =========================================================================
 document.getElementById('market-search').addEventListener('input', () => renderMarkets());
 
-// --- Formatting ---
+// =========================================================================
+// Formatting helpers
+// =========================================================================
 function fmtPrice(p) {
   if (p == null) return '-';
-  return (p * 100).toFixed(1) + '\\u00a2';
+  return (p * 100).toFixed(1) + '\u00a2';
 }
 function fmtChange(pct) {
   if (pct == null) return '<span class="change-zero">-</span>';
@@ -432,56 +585,334 @@ function fmtDuration(secs) {
   if (h > 0) return h + 'h ' + m + 'm';
   return m + 'm';
 }
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s || '';
+  return d.innerHTML;
+}
 
-// --- Render Markets ---
-function renderMarkets() {
-  const query = document.getElementById('market-search').value.toLowerCase();
-  let filtered = markets;
-  if (query) {
-    filtered = markets.filter(m =>
-      m.outcome_name.toLowerCase().includes(query) ||
-      m.event_title.toLowerCase().includes(query)
-    );
+// =========================================================================
+// Group markets by event
+// =========================================================================
+function groupByEvent(marketList) {
+  const groups = new Map();
+  for (const m of marketList) {
+    if (!groups.has(m.event_id)) {
+      groups.set(m.event_id, {
+        event_id: m.event_id,
+        event_title: m.event_title,
+        event_slug: m.event_slug,
+        volume_24h: m.volume_24h,
+        outcomes: [],
+        max_change_1h: 0,
+        max_change_24h: 0,
+        total_snapshots: 0,
+      });
+    }
+    const g = groups.get(m.event_id);
+    g.outcomes.push(m);
+    g.max_change_1h = Math.max(g.max_change_1h, Math.abs(m.change_1h_pct || 0));
+    g.max_change_24h = Math.max(g.max_change_24h, Math.abs(m.change_24h_pct || 0));
+    g.total_snapshots += m.snapshots || 0;
   }
+  return Array.from(groups.values());
+}
 
+// =========================================================================
+// Filter logic
+// =========================================================================
+function applyFilter(groups) {
+  const query = document.getElementById('market-search').value.toLowerCase();
+
+  return groups.filter(g => {
+    // Text search
+    if (query) {
+      const match = g.event_title.toLowerCase().includes(query) ||
+        g.outcomes.some(o => o.outcome_name.toLowerCase().includes(query));
+      if (!match) return false;
+    }
+
+    // Activity filter
+    if (activeFilter === 'active') {
+      return g.max_change_1h > 0.005 || g.total_snapshots > 10;
+    }
+    if (activeFilter === 'alerts') {
+      return g.outcomes.some(o => alertTokens.has(o.token_id));
+    }
+    return true; // 'all'
+  });
+}
+
+// =========================================================================
+// Render Markets (grouped by event)
+// =========================================================================
+function renderMarkets() {
+  const groups = groupByEvent(markets);
+  const filtered = applyFilter(groups);
+
+  // Sort groups
   filtered.sort((a, b) => {
-    let va = a[sortCol], vb = b[sortCol];
-    if (va == null) va = -Infinity;
-    if (vb == null) vb = -Infinity;
-    if (typeof va === 'string') return sortDir * va.localeCompare(vb);
-    return sortDir * (va - vb);
+    let va, vb;
+    if (sortCol === 'change_1h_pct') { va = a.max_change_1h; vb = b.max_change_1h; }
+    else if (sortCol === 'change_24h_pct') { va = a.max_change_24h; vb = b.max_change_24h; }
+    else if (sortCol === 'volume_24h') { va = a.volume_24h; vb = b.volume_24h; }
+    else if (sortCol === 'snapshots') { va = a.total_snapshots; vb = b.total_snapshots; }
+    else { va = a.event_title; vb = b.event_title;
+      if (typeof va === 'string') return sortDir * va.localeCompare(vb);
+    }
+    return sortDir * ((va || 0) - (vb || 0));
   });
 
   const tbody = document.getElementById('markets-body');
   const empty = document.getElementById('markets-empty');
 
+  // Update counts
+  const totalOutcomes = filtered.reduce((s, g) => s + g.outcomes.length, 0);
+  document.getElementById('markets-count').textContent = totalOutcomes;
+
   if (filtered.length === 0) {
     tbody.innerHTML = '';
     empty.style.display = 'block';
-    empty.textContent = query ? 'No matches' : 'Loading markets...';
+    empty.textContent = document.getElementById('market-search').value ? 'No matches' : 'No active markets yet...';
     return;
   }
   empty.style.display = 'none';
 
-  tbody.innerHTML = filtered.map(m => {
-    const polyUrl = m.event_slug ? `https://polymarket.com/event/${m.event_slug}` : '#';
-    return `<tr>
-      <td class="truncate">${esc(m.outcome_name)}</td>
-      <td class="truncate"><a class="link" href="${polyUrl}" target="_blank">${esc(m.event_title)}</a></td>
-      <td class="price">${fmtPrice(m.current_price)}</td>
-      <td>${fmtChange(m.change_1h_pct)}</td>
-      <td>${fmtChange(m.change_24h_pct)}</td>
-      <td>${fmtVol(m.volume_24h)}</td>
-      <td>${m.snapshots}</td>
-      <td style="color:var(--text-dim)">${fmtTime(m.last_update)}</td>
+  // Sort arrows
+  document.querySelectorAll('th[data-sort]').forEach(th => {
+    const arrow = th.querySelector('.sort-arrow');
+    if (arrow) arrow.remove();
+    if (th.dataset.sort === sortCol) {
+      th.insertAdjacentHTML('beforeend',
+        `<span class="sort-arrow">${sortDir === -1 ? '\u25BC' : '\u25B2'}</span>`);
+    }
+  });
+
+  let html = '';
+  for (const g of filtered) {
+    const expanded = expandedEvents.has(g.event_id);
+    const polyUrl = g.event_slug ? `https://polymarket.com/event/${g.event_slug}` : '#';
+    const chevron = expanded ? '\u25B6' : '\u25B6';
+    const bestOutcome = g.outcomes.reduce((best, o) =>
+      Math.abs(o.change_1h_pct || 0) > Math.abs(best.change_1h_pct || 0) ? o : best, g.outcomes[0]);
+
+    html += `<tr class="event-row ${expanded ? 'expanded' : ''}" data-event-id="${g.event_id}">
+      <td>
+        <span class="chevron">\u25B6</span>
+        <a class="link" href="${polyUrl}" target="_blank">${esc(g.event_title)}</a>
+        <span class="outcome-count">${g.outcomes.length} outcome${g.outcomes.length > 1 ? 's' : ''}</span>
+      </td>
+      <td class="price">${fmtPrice(bestOutcome.current_price)}</td>
+      <td>${fmtChange(g.max_change_1h > 0.0001 ? g.max_change_1h : null)}</td>
+      <td>${fmtChange(g.max_change_24h > 0.0001 ? g.max_change_24h : null)}</td>
+      <td>${fmtVol(g.volume_24h)}</td>
+      <td>${g.total_snapshots}</td>
     </tr>`;
-  }).join('');
+
+    if (expanded) {
+      // Sort outcomes by absolute 1h change
+      const sorted = [...g.outcomes].sort((a, b) =>
+        Math.abs(b.change_1h_pct || 0) - Math.abs(a.change_1h_pct || 0));
+
+      for (const o of sorted) {
+        const isChartOpen = openChartToken === o.token_id;
+        html += `<tr class="outcome-row" data-token-id="${o.token_id}">
+          <td>${esc(o.outcome_name)}</td>
+          <td class="price">${fmtPrice(o.current_price)}</td>
+          <td>${fmtChange(o.change_1h_pct)}</td>
+          <td>${fmtChange(o.change_24h_pct)}</td>
+          <td>${fmtVol(o.volume_24h)}</td>
+          <td>${o.snapshots}</td>
+        </tr>`;
+
+        if (isChartOpen) {
+          html += `<tr class="chart-row"><td colspan="6">
+            <div class="chart-header">
+              <div>
+                <span class="chart-title">${esc(o.outcome_name)}</span>
+                <span class="chart-meta"> &mdash; ${esc(o.event_title)}</span>
+              </div>
+              <span class="chart-meta">${fmtPrice(o.current_price)} | ${fmtVol(o.volume_24h)} vol</span>
+            </div>
+            <div class="chart-container"><canvas id="price-chart"></canvas></div>
+          </td></tr>`;
+        }
+      }
+    }
+  }
+  tbody.innerHTML = html;
+
+  // Attach event row click handlers
+  tbody.querySelectorAll('.event-row').forEach(row => {
+    row.addEventListener('click', (e) => {
+      if (e.target.closest('a')) return; // Don't toggle on link click
+      const eid = row.dataset.eventId;
+      if (expandedEvents.has(eid)) expandedEvents.delete(eid);
+      else expandedEvents.add(eid);
+      renderMarkets();
+    });
+  });
+
+  // Attach outcome row click handlers for chart
+  tbody.querySelectorAll('.outcome-row').forEach(row => {
+    row.addEventListener('click', () => {
+      const tid = row.dataset.tokenId;
+      if (openChartToken === tid) {
+        openChartToken = null;
+      } else {
+        openChartToken = tid;
+      }
+      renderMarkets();
+      if (openChartToken) loadChart(openChartToken);
+    });
+  });
+
+  // Re-render chart if open
+  if (openChartToken && document.getElementById('price-chart')) {
+    loadChart(openChartToken);
+  }
 }
 
-// --- Render Alerts ---
+// =========================================================================
+// Chart rendering
+// =========================================================================
+async function loadChart(tokenId) {
+  const canvas = document.getElementById('price-chart');
+  if (!canvas) return;
+
+  // Check cache
+  const cached = chartCache.get(tokenId);
+  if (cached && Date.now() - cached.fetchedAt < 60000) {
+    drawChart(canvas, cached.data);
+    return;
+  }
+
+  // Show loading
+  const container = canvas.parentElement;
+  container.innerHTML = '<div class="chart-loading">Loading chart...</div>';
+
+  try {
+    const res = await fetch(`/api/market/${tokenId}`);
+    const data = await res.json();
+    chartCache.set(tokenId, { data, fetchedAt: Date.now() });
+
+    // Re-check canvas exists (user might have closed)
+    const canvas2 = document.getElementById('price-chart');
+    if (canvas2) drawChart(canvas2, data);
+    else {
+      // Rebuild canvas
+      container.innerHTML = '<canvas id="price-chart"></canvas>';
+      drawChart(document.getElementById('price-chart'), data);
+    }
+  } catch (e) {
+    container.innerHTML = '<div class="chart-loading">Failed to load chart</div>';
+  }
+}
+
+function drawChart(canvas, data) {
+  if (chartInstance) { chartInstance.destroy(); chartInstance = null; }
+  if (!data.history || data.history.length === 0) {
+    canvas.parentElement.innerHTML = '<div class="chart-loading">No price history yet</div>';
+    return;
+  }
+
+  const labels = data.history.map(h => new Date(h.t + 'Z'));
+  const prices = data.history.map(h => h.p ? h.p * 100 : null); // cents
+  const bids = data.history.map(h => h.bid ? h.bid * 100 : null);
+  const asks = data.history.map(h => h.ask ? h.ask * 100 : null);
+
+  chartInstance = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        {
+          label: 'Ask',
+          data: asks,
+          borderColor: 'transparent',
+          backgroundColor: 'rgba(88,166,255,0.08)',
+          fill: '+1',
+          pointRadius: 0,
+          tension: 0.3,
+        },
+        {
+          label: 'Mid Price',
+          data: prices,
+          borderColor: '#58a6ff',
+          borderWidth: 2,
+          backgroundColor: 'transparent',
+          fill: false,
+          pointRadius: 0,
+          tension: 0.3,
+        },
+        {
+          label: 'Bid',
+          data: bids,
+          borderColor: 'transparent',
+          backgroundColor: 'rgba(88,166,255,0.08)',
+          fill: '-1',
+          pointRadius: 0,
+          tension: 0.3,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: { duration: 300 },
+      interaction: { intersect: false, mode: 'index' },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: '#161b22',
+          borderColor: '#30363d',
+          borderWidth: 1,
+          titleColor: '#c9d1d9',
+          bodyColor: '#c9d1d9',
+          callbacks: {
+            title: (items) => {
+              if (items[0]) return new Date(items[0].parsed.x).toLocaleString();
+              return '';
+            },
+            label: (item) => {
+              if (item.datasetIndex === 1) return `Price: ${item.parsed.y.toFixed(1)}\u00a2`;
+              if (item.datasetIndex === 0) return `Ask: ${item.parsed.y.toFixed(1)}\u00a2`;
+              if (item.datasetIndex === 2) return `Bid: ${item.parsed.y.toFixed(1)}\u00a2`;
+              return '';
+            },
+          },
+        },
+      },
+      scales: {
+        x: {
+          type: 'time',
+          time: { tooltipFormat: 'MMM d, HH:mm' },
+          grid: { color: 'rgba(48,54,61,0.5)' },
+          ticks: { color: '#8b949e', maxTicksLimit: 8, font: { size: 11 } },
+        },
+        y: {
+          grid: { color: 'rgba(48,54,61,0.5)' },
+          ticks: {
+            color: '#8b949e',
+            font: { size: 11 },
+            callback: (v) => v.toFixed(1) + '\u00a2',
+          },
+        },
+      },
+    },
+  });
+}
+
+// =========================================================================
+// Render Alerts
+// =========================================================================
 function renderAlerts() {
   const list = document.getElementById('alerts-list');
   const empty = document.getElementById('alerts-empty');
+  document.getElementById('alerts-count').textContent = alerts.length;
+
+  // Track tokens with alerts
+  alertTokens = new Set(alerts.map(a => a.token_id));
 
   if (alerts.length === 0) {
     empty.style.display = 'block';
@@ -489,7 +920,6 @@ function renderAlerts() {
   }
   empty.style.display = 'none';
 
-  // Newest first
   const sorted = [...alerts].reverse();
   list.innerHTML = sorted.map(a => {
     const cls = a.news_driven ? 'alert-card news-driven' : 'alert-card';
@@ -497,8 +927,8 @@ function renderAlerts() {
       ? '<span class="badge badge-news">NEWS-DRIVEN</span>'
       : '<span class="badge badge-unexplained">UNEXPLAINED</span>';
     const dirBadge = a.direction === 'up'
-      ? '<span class="badge badge-up">\\u2191 UP</span>'
-      : '<span class="badge badge-down">\\u2193 DOWN</span>';
+      ? '<span class="badge badge-up">\u2191 UP</span>'
+      : '<span class="badge badge-down">\u2193 DOWN</span>';
     const polyUrl = a.event_slug ? `https://polymarket.com/event/${a.event_slug}` : '#';
 
     return `<div class="${cls}">
@@ -511,8 +941,8 @@ function renderAlerts() {
       </div>
       <div class="alert-detail">
         ${dirBadge} ${badge}
-        &nbsp; ${fmtPrice(a.price_before)} \\u2192 ${fmtPrice(a.price_after)}
-        &nbsp; (${a.abs_change >= 0.01 ? (a.abs_change * 100).toFixed(1) + '\\u00a2' : '<1\\u00a2'} in ${fmtDuration(a.window_seconds)})
+        &nbsp; ${fmtPrice(a.price_before)} \u2192 ${fmtPrice(a.price_after)}
+        &nbsp; (${a.abs_change >= 0.01 ? (a.abs_change * 100).toFixed(1) + '\u00a2' : '<1\u00a2'} in ${fmtDuration(a.window_seconds)})
         &nbsp; Vol: ${fmtVol(a.event_volume_24h)}
         ${a.is_off_hours ? '&nbsp; <span class="badge badge-unexplained">OFF-HOURS</span>' : ''}
       </div>
@@ -521,13 +951,44 @@ function renderAlerts() {
   }).join('');
 }
 
-function esc(s) {
-  const d = document.createElement('div');
-  d.textContent = s || '';
-  return d.innerHTML;
+// =========================================================================
+// Live Ticker
+// =========================================================================
+function addTickerItem(update) {
+  tickerItems.unshift(update);
+  if (tickerItems.length > 12) tickerItems.pop();
+  renderTicker();
 }
 
-// --- WebSocket ---
+function renderTicker() {
+  const container = document.getElementById('ticker-items');
+  container.innerHTML = tickerItems.map(u => {
+    const cls = u.change_pct >= 0 ? 'up' : 'down';
+    const arrow = u.change_pct >= 0 ? '\u2191' : '\u2193';
+    const name = u.outcome_name.length > 20 ? u.outcome_name.slice(0, 18) + '..' : u.outcome_name;
+    return `<span class="ticker-pill ${cls}">
+      ${esc(name)} ${fmtPrice(u.prev_price)}\u2192${fmtPrice(u.price)}
+      ${arrow}${Math.abs(u.change_pct * 100).toFixed(1)}%
+    </span>`;
+  }).join('');
+}
+
+// =========================================================================
+// Row flash on price update
+// =========================================================================
+function flashRows(updates) {
+  for (const u of updates) {
+    const row = document.querySelector(`[data-token-id="${u.token_id}"]`);
+    if (!row) continue;
+    const cls = u.change_pct >= 0 ? 'flash-green' : 'flash-red';
+    row.classList.add(cls);
+    setTimeout(() => row.classList.remove(cls), 1500);
+  }
+}
+
+// =========================================================================
+// WebSocket
+// =========================================================================
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}/ws`);
@@ -550,12 +1011,19 @@ function connectWS() {
     } else if (msg.type === 'alert') {
       alerts.push(msg.data);
       renderAlerts();
-      // Flash the alerts tab
       const tab = document.querySelector('[data-panel="alerts-panel"]');
       if (!tab.classList.contains('active')) {
         tab.style.color = 'var(--yellow)';
         setTimeout(() => { tab.style.color = ''; }, 2000);
       }
+    } else if (msg.type === 'price_updates') {
+      for (const u of msg.data) {
+        addTickerItem(u);
+        // Update in-memory market data
+        const m = markets.find(x => x.token_id === u.token_id);
+        if (m) m.current_price = u.price;
+      }
+      flashRows(msg.data);
     }
   };
 }
@@ -573,7 +1041,9 @@ function updateMetrics(stats) {
   }
 }
 
-// --- Initial data load ---
+// =========================================================================
+// Initial data load + periodic refresh
+// =========================================================================
 async function loadInitial() {
   try {
     const [mRes, aRes] = await Promise.all([
@@ -588,7 +1058,6 @@ async function loadInitial() {
   }
 }
 
-// --- Periodic market refresh ---
 setInterval(async () => {
   try {
     const res = await fetch('/api/markets');
@@ -597,7 +1066,9 @@ setInterval(async () => {
   } catch (e) {}
 }, 15000);
 
-// --- Start ---
+// =========================================================================
+// Start
+// =========================================================================
 loadInitial();
 connectWS();
 </script>
