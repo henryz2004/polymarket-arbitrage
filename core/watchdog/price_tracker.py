@@ -45,6 +45,11 @@ class WatchedMarket:
 
         self.last_sample_at: Optional[datetime] = None
 
+        # Gamma API probability — the "display price" shown on Polymarket's site.
+        # Updated on each registry refresh. More accurate than mid-price when
+        # spreads are wide (e.g. bid=0.001, ask=0.999 → mid=0.5 is misleading).
+        self.gamma_price: Optional[float] = None
+
     @property
     def current_price(self) -> Optional[float]:
         """Get most recent mid-price."""
@@ -89,7 +94,7 @@ class PriceTracker:
         if outcome.token_id in self._markets:
             return
 
-        self._markets[outcome.token_id] = WatchedMarket(
+        market = WatchedMarket(
             token_id=outcome.token_id,
             event_id=event.event_id,
             outcome_name=outcome.name,
@@ -98,6 +103,10 @@ class PriceTracker:
             event_volume_24h=event.volume_24h,
             max_history_hours=self.config.price_history_window_hours,
         )
+        # Seed gamma price from the initial BBA if source is "gamma"
+        if outcome.bba.source == "gamma" and outcome.bba.best_ask is not None:
+            market.gamma_price = outcome.bba.best_ask
+        self._markets[outcome.token_id] = market
 
     def remove_watch(self, token_id: str) -> None:
         """Remove an outcome from the watch list."""

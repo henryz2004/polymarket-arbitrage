@@ -15,7 +15,7 @@ Usage:
 import asyncio
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -96,6 +96,21 @@ async def get_markets():
         price_1h = engine.price_tracker.get_price_change(token_id, 3600)
         price_24h = engine.price_tracker.get_price_change(token_id, 86400)
 
+        # Get the Gamma API probability as display price — much more accurate
+        # than mid-price when spreads are wide (e.g. bid=0.001, ask=0.999 → mid=0.5).
+        gamma_price = None
+        registry_result = engine.registry.get_event_by_token(token_id)
+        if registry_result:
+            _, outcome = registry_result
+            gamma_price = outcome.gamma_probability
+
+        # Use gamma price as display price; fall back to mid-price only when
+        # gamma is unavailable (rare).
+        best_bid = current.best_bid if current else None
+        best_ask = current.best_ask if current else None
+        spread = (best_ask - best_bid) if (best_bid is not None and best_ask is not None) else None
+        display_price = gamma_price if gamma_price is not None else m.current_price
+
         result.append({
             "token_id": token_id,
             "event_id": m.event_id,
@@ -103,9 +118,10 @@ async def get_markets():
             "event_slug": m.event_slug,
             "outcome_name": m.outcome_name,
             "volume_24h": m.event_volume_24h,
-            "current_price": m.current_price,
-            "best_bid": current.best_bid if current else None,
-            "best_ask": current.best_ask if current else None,
+            "current_price": display_price,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "spread": spread,
             "last_update": current.timestamp.isoformat() if current else None,
             "source": current.source if current else None,
             "snapshots": len(m.live_history),
@@ -176,6 +192,196 @@ def _load_alert_history():
             pass
 
 
+def _parse_naive_utc(ts: str) -> Optional[datetime]:
+    """Parse an ISO timestamp and return a naive-UTC datetime for comparison."""
+    try:
+        dt = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+    # Strip timezone info — treat everything as UTC
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _load_alerts_since(hours: int) -> list[dict]:
+    """Load alerts from JSONL files within the last N hours."""
+    cutoff = datetime.utcnow() - timedelta(hours=hours)
+    alerts = []
+    alert_dir = Path("logs/watchdog")
+    if not alert_dir.exists():
+        return alerts
+    for f in sorted(alert_dir.glob("alerts_*.jsonl")):
+        try:
+            for line in f.read_text().strip().split("\n"):
+                if not line:
+                    continue
+                alert = json.loads(line)
+                dt = _parse_naive_utc(alert.get("detected_at", ""))
+                if dt is None:
+                    continue
+                if dt >= cutoff:
+                    alerts.append(alert)
+        except Exception:
+            pass
+    # Also include in-memory alerts not yet flushed to disk
+    for alert in _alert_history:
+        dt = _parse_naive_utc(alert.get("detected_at", ""))
+        if dt is None:
+            continue
+        if dt >= cutoff and not any(
+            a.get("alert_id") == alert.get("alert_id") for a in alerts
+        ):
+            alerts.append(alert)
+    alerts.sort(key=lambda a: a.get("detected_at", ""))
+    return alerts
+
+
+def _enrich_alert_with_current_price(alert: dict, engine) -> dict:
+    """Add current market state to an alert so an investigator can compare."""
+    token_id = alert.get("token_id")
+    if not token_id or not engine:
+        return alert
+
+    enriched = dict(alert)
+    markets = engine.price_tracker.get_watched_markets()
+    m = markets.get(token_id)
+    if m:
+        enriched["current_price"] = m.current_price
+        current = m.current_snapshot
+        if current:
+            enriched["current_bid"] = current.best_bid
+            enriched["current_ask"] = current.best_ask
+            enriched["current_source"] = current.source
+            enriched["current_as_of"] = current.timestamp.isoformat()
+
+        # Price trajectory since alert: where did price go after the spike?
+        alert_time = _parse_naive_utc(alert.get("detected_at", ""))
+
+        if alert_time and m.live_history:
+            post_alert = [
+                s for s in m.live_history if s.timestamp > alert_time
+            ]
+            if post_alert:
+                prices = [s.mid_price for s in post_alert if s.mid_price is not None]
+                if prices:
+                    enriched["post_alert_high"] = round(max(prices), 4)
+                    enriched["post_alert_low"] = round(min(prices), 4)
+                    enriched["post_alert_latest"] = round(prices[-1], 4)
+                    enriched["post_alert_samples"] = len(prices)
+
+        # Did price revert? (potential false positive indicator)
+        price_after = alert.get("price_after")
+        if price_after and m.current_price is not None:
+            revert = m.current_price - price_after
+            enriched["price_reversion"] = round(revert, 4)
+            enriched["reverted"] = (
+                abs(revert) > 0.03
+                and (
+                    (alert.get("direction") == "up" and revert < -0.03)
+                    or (alert.get("direction") == "down" and revert > 0.03)
+                )
+            )
+    else:
+        enriched["current_price"] = None
+        enriched["market_still_watched"] = False
+
+    return enriched
+
+
+@app.get("/api/status")
+async def get_full_status(lookback_hours: int = 24):
+    """Comprehensive status endpoint for remote agent investigation.
+
+    Returns system health, enriched alerts with current market context,
+    and market summaries — enough for an agent to classify signals as
+    true/false positive/negative.
+
+    Query params:
+        lookback_hours: how far back to fetch alerts (default 24)
+    """
+    engine = _engine()
+    now = datetime.utcnow()
+
+    # --- System health ---
+    health = {"status": "offline", "checked_at": now.isoformat()}
+    if engine and _runner:
+        stats = engine.get_stats()
+        runtime = datetime.now() - _runner.start_time
+        health.update({
+            "status": "running" if stats.get("running") else "stopped",
+            "uptime_seconds": round(runtime.total_seconds()),
+            "uptime_human": str(timedelta(seconds=int(runtime.total_seconds()))),
+            "started_at": _runner.start_time.isoformat(),
+            "total_scans": stats.get("total_scans", 0),
+            "total_alerts": stats.get("total_alerts", 0),
+            "markets_watched": stats.get("price_tracker", {}).get("markets_watched", 0),
+            "markets_with_data": stats.get("price_tracker", {}).get("markets_with_data", 0),
+            "total_snapshots": stats.get("price_tracker", {}).get("total_snapshots", 0),
+            "detector_checks": stats.get("anomaly_detector", {}).get("checks_performed", 0),
+            "detector_highest_score": stats.get("anomaly_detector", {}).get("highest_score", 0),
+            "active_cooldowns": stats.get("anomaly_detector", {}).get("active_cooldowns", 0),
+            "ws_messages": stats.get("websocket", {}).get("ws_messages", 0),
+        })
+
+    # --- Alerts with enrichment ---
+    raw_alerts = _load_alerts_since(lookback_hours)
+    enriched_alerts = [
+        _enrich_alert_with_current_price(a, engine) for a in raw_alerts
+    ]
+
+    # Summary stats on alerts
+    alert_summary = {
+        "count": len(enriched_alerts),
+        "lookback_hours": lookback_hours,
+        "by_score_bucket": {
+            "critical_7_plus": len([a for a in enriched_alerts if a.get("suspicion_score", 0) >= 7]),
+            "high_5_to_7": len([a for a in enriched_alerts if 5 <= a.get("suspicion_score", 0) < 7]),
+            "medium_3_to_5": len([a for a in enriched_alerts if 3 <= a.get("suspicion_score", 0) < 5]),
+            "low_under_3": len([a for a in enriched_alerts if a.get("suspicion_score", 0) < 3]),
+        },
+        "news_driven_count": len([a for a in enriched_alerts if a.get("news_driven")]),
+        "unexplained_count": len([a for a in enriched_alerts if not a.get("news_driven")]),
+        "off_hours_count": len([a for a in enriched_alerts if a.get("is_off_hours")]),
+        "reverted_count": len([a for a in enriched_alerts if a.get("reverted")]),
+    }
+
+    # --- Top movers (markets with biggest recent price changes) ---
+    top_movers = []
+    if engine:
+        markets = engine.price_tracker.get_watched_markets()
+        for token_id, m in markets.items():
+            change_1h = engine.price_tracker.get_price_change(token_id, 3600)
+            change_4h = engine.price_tracker.get_price_change(token_id, 14400)
+            change_24h = engine.price_tracker.get_price_change(token_id, 86400)
+            if not any([change_1h, change_4h, change_24h]):
+                continue
+            top_movers.append({
+                "token_id": token_id,
+                "event_title": m.event_title,
+                "event_slug": m.event_slug,
+                "outcome_name": m.outcome_name,
+                "volume_24h": m.event_volume_24h,
+                "current_price": m.current_price,
+                "change_1h_pct": round(change_1h[2], 2) if change_1h else None,
+                "change_4h_pct": round(change_4h[2], 2) if change_4h else None,
+                "change_24h_pct": round(change_24h[2], 2) if change_24h else None,
+                "snapshots": len(m.live_history),
+            })
+        top_movers.sort(
+            key=lambda x: abs(x.get("change_1h_pct") or x.get("change_4h_pct") or 0),
+            reverse=True,
+        )
+        top_movers = top_movers[:30]
+
+    return {
+        "health": health,
+        "alert_summary": alert_summary,
+        "alerts": enriched_alerts,
+        "top_movers": top_movers,
+    }
+
+
 # ---------------------------------------------------------------------------
 # WebSocket for live updates
 # ---------------------------------------------------------------------------
@@ -198,11 +404,16 @@ async def websocket_endpoint(ws: WebSocket):
                 stats["runtime_seconds"] = runtime.total_seconds()
                 await ws.send_text(json.dumps({"type": "stats", "data": stats}, default=str))
 
-                # Price deltas
+                # Price deltas — use gamma probability for display
                 updates = []
                 watched = engine.price_tracker.get_watched_markets()
                 for token_id, m in watched.items():
-                    price = m.current_price
+                    # Prefer gamma probability for display accuracy
+                    gamma_price = None
+                    reg = engine.registry.get_event_by_token(token_id)
+                    if reg:
+                        gamma_price = reg[1].gamma_probability
+                    price = gamma_price if gamma_price is not None else m.current_price
                     if price is None:
                         continue
                     prev = _last_prices.get(token_id)

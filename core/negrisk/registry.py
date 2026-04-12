@@ -469,6 +469,7 @@ class NegriskRegistry:
                 ),
                 volume_24h=float(market_data.get("volume24hr", 0) or 0),
                 liquidity=float(market_data.get("liquidity", 0) or 0),
+                gamma_probability=best_ask,
             )
 
             return outcome

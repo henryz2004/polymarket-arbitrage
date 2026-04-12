@@ -93,6 +93,9 @@ class Outcome:
     bba: OutcomeBBA = field(default_factory=OutcomeBBA)
     volume_24h: float = 0.0
     liquidity: float = 0.0
+    # Gamma API probability — refreshed on each registry poll, not overwritten
+    # by CLOB/WS data. More accurate display price than mid of wide spreads.
+    gamma_probability: Optional[float] = None
 
     @property
     def ask_price(self) -> Optional[float]:
